@@ -1,0 +1,15 @@
+as_of: "2026-07-28"
+cash_reserve: 0.05
+targets:
+  - symbol: "600519"
+    weight: 0.25
+    price: 1800.0
+  - symbol: "000858"
+    weight: 0.25
+    price: 150.0
+  - symbol: "601318"
+    weight: 0.25
+    price: 50.0
+  - symbol: "000001"
+    weight: 0.25
+    price: 12.0
