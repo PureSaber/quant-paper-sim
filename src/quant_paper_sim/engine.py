@@ -143,7 +143,7 @@ def run_step(config_path: Path) -> RebalanceResult:
     if portfolio.cash <= 0 and not portfolio.holdings:
         portfolio.cash = initial_capital
 
-    signals = load_signals(cfg, repo_root)
+    signals = load_signals(cfg, config_path)
     commission = float(cfg.get("commission_rate", 0.0003))
     result = rebalance(portfolio, signals, commission_rate=commission)
 

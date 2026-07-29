@@ -60,21 +60,31 @@ def load_q5_csv(path: Path, top_n: int, cash_reserve: float, regime_scale: float
     )
 
 
-def load_signals(cfg: dict, repo_root: Path) -> SignalBundle:
+def _resolve_data_path(raw: str, config_path: Path) -> Path:
+    path = Path(raw)
+    if path.is_absolute():
+        return path
+    config_dir = config_path.parent
+    for base in (config_dir, config_dir.parent):
+        candidate = (base / path).resolve()
+        if candidate.is_file():
+            return candidate
+    return (config_dir.parent / path).resolve()
+
+
+def load_signals(cfg: dict, config_path: Path) -> SignalBundle:
     sig = cfg.get("signals") or {}
     regime_cfg = cfg.get("regime") or {}
     regime_path = regime_cfg.get("path")
     regime_scale = load_regime_scale(
-        Path(regime_path) if regime_path else None
+        _resolve_data_path(str(regime_path), config_path) if regime_path else None
     )
     if regime_cfg.get("override_scale") is not None:
         regime_scale = float(regime_cfg["override_scale"])
 
     cash_reserve = float(cfg.get("cash_reserve", 0.05))
     source = str(sig.get("source", "yaml"))
-    path = Path(sig["path"])
-    if not path.is_absolute():
-        path = repo_root / path
+    path = _resolve_data_path(str(sig["path"]), config_path)
 
     if source == "q5_csv":
         return load_q5_csv(path, int(sig.get("top_n", 10)), cash_reserve, regime_scale)

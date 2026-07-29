@@ -1,0 +1,11 @@
+state_dir: state
+initial_capital: 100000
+cash_reserve: 0.05
+commission_rate: 0.0003
+
+signals:
+  source: yaml
+  path: tests/fixtures/signals.yaml
+
+regime:
+  path: ../quant-regime/state/regime.json
