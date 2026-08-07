@@ -1,0 +1,21 @@
+﻿# Unified pre-commit for PureSaber quant Python packages.
+# Installed by scripts/install-pre-commit.ps1 鈥?do not edit paths manually per repo.
+
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.9.10
+    hooks:
+      - id: ruff
+        name: ruff check
+        args: [--fix, src, tests]
+      - id: ruff-format
+
+  - repo: local
+    hooks:
+      - id: pytest-quick
+        name: pytest
+        entry: pytest -q
+        language: system
+        pass_filenames: false
+        always_run: true
+
