@@ -1,0 +1,13 @@
+state_dir: state
+initial_capital: 100000
+cash_reserve: 0.05
+commission_rate: 0.0003
+
+signals:
+  source: csv
+  path: tests/fixtures/factor_signals.csv
+  factor_column: momentum_20d
+  top_n: 3
+
+regime:
+  path: tests/fixtures/regime.json
