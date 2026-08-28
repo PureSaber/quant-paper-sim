@@ -2,11 +2,14 @@ state_dir: state
 initial_capital: 100000
 cash_reserve: 0.05
 commission_rate: 0.0003
+stamp_duty_rate: 0.0005
+stale_exit_price_policy: last_known_signal_close
 
 signals:
   source: csv
   path: tests/fixtures/factor_signals.csv
   factor_column: momentum_20d
+  price_column: close
   top_n: 3
 
 regime:

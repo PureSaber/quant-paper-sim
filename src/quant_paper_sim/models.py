@@ -18,6 +18,9 @@ class SignalBundle:
     regime_scale: float = 1.0
     cash_reserve: float = 0.05
 
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
 
 @dataclass
 class Holding:
@@ -36,6 +39,8 @@ class PortfolioState:
     cash: float
     holdings: list[Holding] = field(default_factory=list)
     initial_capital: float = 0.0
+    authoritative: bool = False
+    execution_log_sha256: str = ""
 
     @property
     def invested_value(self) -> float:
