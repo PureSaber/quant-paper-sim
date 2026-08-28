@@ -42,7 +42,7 @@ def load_signal_yaml(path: Path, cash_reserve: float, regime_scale: float) -> Si
 
 
 def load_q5_csv(path: Path, top_n: int, cash_reserve: float, regime_scale: float) -> SignalBundle:
-    df = pd.read_csv(path)
+    df = pd.read_csv(path, dtype={"symbol": str})
     if df.empty:
         raise ValueError(f"empty q5 csv: {path}")
     as_of = path.stem.replace("q5_candidates_", "")
@@ -60,7 +60,52 @@ def load_q5_csv(path: Path, top_n: int, cash_reserve: float, regime_scale: float
     )
 
 
-def _resolve_data_path(raw: str, config_path: Path) -> Path:
+def load_factor_csv(
+    path: Path,
+    *,
+    factor_column: str,
+    price_column: str,
+    top_n: int,
+    cash_reserve: float,
+    regime_scale: float,
+) -> SignalBundle:
+    df = pd.read_csv(path, dtype={"symbol": str})
+    required = {"symbol", "date", factor_column, price_column}
+    missing = sorted(required - set(df.columns))
+    if missing:
+        raise ValueError(f"factor csv is missing columns {missing}: {path}")
+    if df.empty:
+        raise ValueError(f"empty factor csv: {path}")
+    as_of = str(df["date"].max())
+    current = df.loc[df["date"].astype(str).eq(as_of)].copy()
+    current = current.sort_values([factor_column, "symbol"], ascending=[False, True]).head(top_n)
+    if current.empty:
+        raise ValueError(f"factor csv has no rows for latest date {as_of}: {path}")
+    if current[[factor_column, price_column]].isna().any().any():
+        raise ValueError("factor csv contains null factor or price values")
+    if (current[price_column] <= 0).any():
+        raise ValueError("factor csv prices must be positive")
+    if "weight" in current and (current["weight"] >= 0).all() and current["weight"].sum() > 0:
+        weights = current["weight"] / current["weight"].sum()
+    else:
+        weights = pd.Series(1.0 / len(current), index=current.index)
+    targets = [
+        TargetPosition(
+            symbol=str(row["symbol"]),
+            weight=float(weights.loc[index]),
+            price=float(row[price_column]),
+        )
+        for index, row in current.iterrows()
+    ]
+    return SignalBundle(
+        as_of=as_of,
+        targets=targets,
+        regime_scale=regime_scale,
+        cash_reserve=cash_reserve,
+    )
+
+
+def resolve_data_path(raw: str, config_path: Path) -> Path:
     path = Path(raw)
     if path.is_absolute():
         return path
@@ -77,15 +122,29 @@ def load_signals(cfg: dict, config_path: Path) -> SignalBundle:
     regime_cfg = cfg.get("regime") or {}
     regime_path = regime_cfg.get("path")
     regime_scale = load_regime_scale(
-        _resolve_data_path(str(regime_path), config_path) if regime_path else None
+        resolve_data_path(str(regime_path), config_path) if regime_path else None
     )
     if regime_cfg.get("override_scale") is not None:
         regime_scale = float(regime_cfg["override_scale"])
 
     cash_reserve = float(cfg.get("cash_reserve", 0.05))
     source = str(sig.get("source", "yaml"))
-    path = _resolve_data_path(str(sig["path"]), config_path)
+    path = resolve_data_path(str(sig["path"]), config_path)
 
     if source == "q5_csv":
         return load_q5_csv(path, int(sig.get("top_n", 10)), cash_reserve, regime_scale)
-    return load_signal_yaml(path, cash_reserve, regime_scale)
+    if source == "csv":
+        factor_column = str(sig.get("factor_column", "")).strip()
+        if not factor_column:
+            raise ValueError("signals.factor_column is required for source: csv")
+        return load_factor_csv(
+            path,
+            factor_column=factor_column,
+            price_column=str(sig.get("price_column", "close")),
+            top_n=int(sig.get("top_n", 10)),
+            cash_reserve=cash_reserve,
+            regime_scale=regime_scale,
+        )
+    if source == "yaml":
+        return load_signal_yaml(path, cash_reserve, regime_scale)
+    raise ValueError(f"unsupported signals.source: {source!r}")
