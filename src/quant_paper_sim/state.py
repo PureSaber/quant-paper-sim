@@ -19,6 +19,7 @@ from quant_paper_sim import __version__ as paper_sim_version
 LOG_SCHEMA = "quant-paper-execution-log/1.0.0"
 LOG_FILE = "execution_log.json"
 PROJECTION_MANIFEST_FILE = "projection_manifest.json"
+EXECUTION_ARTIFACTS_FILE = "execution_artifacts.json"
 PENDING_FILE = ".paper_commit_pending.json"
 
 
@@ -228,6 +229,10 @@ class StatePaths:
     @property
     def projection_manifest(self) -> Path:
         return self.root / PROJECTION_MANIFEST_FILE
+
+    @property
+    def execution_artifacts(self) -> Path:
+        return self.root / EXECUTION_ARTIFACTS_FILE
 
     @property
     def pending(self) -> Path:

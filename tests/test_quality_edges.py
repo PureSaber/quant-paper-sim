@@ -37,7 +37,7 @@ from quant_paper_sim.readers.signals import (
     load_signals,
     resolve_data_path,
 )
-from quant_paper_sim.state import StateError, StatePaths, new_log, seal_log, validate_log
+from quant_paper_sim.state import StateError, StatePaths, load_log, new_log, seal_log, validate_log
 
 
 def make_case(tmp_path: Path, *, state_dir: str | None = None) -> tuple[Path, Path, Path]:
@@ -161,6 +161,97 @@ def test_old_step_pending_marker_and_evidence_tampering_fail_closed(tmp_path: Pa
         status(config)
 
 
+def test_missing_log_with_interrupted_v2_commit_never_migrates_projection_cash(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config, signal, state = make_case(tmp_path)
+    write_signal(signal)
+    real_atomic_write_json = paper_engine.atomic_write_json
+
+    def fail_before_authoritative_log(path: Path, payload: object) -> None:
+        if path.name == "execution_log.json":
+            raise OSError("injected crash before authoritative log")
+        real_atomic_write_json(path, payload)
+
+    monkeypatch.setattr(paper_engine, "atomic_write_json", fail_before_authoritative_log)
+    with pytest.raises(OSError, match="injected crash"):
+        run_step(config)
+    monkeypatch.setattr(paper_engine, "atomic_write_json", real_atomic_write_json)
+
+    assert not (state / "execution_log.json").exists()
+    assert (state / ".paper_commit_pending.json").is_file()
+    projection = json.loads((state / "portfolio.json").read_text(encoding="utf-8"))
+    projection["cash"] = 777
+    (state / "portfolio.json").write_text(json.dumps(projection), encoding="utf-8")
+
+    with pytest.raises(StateError, match="v2 state residue"):
+        status(config)
+    assert not (state / "execution_log.json").exists()
+
+
+def test_deleted_log_with_v2_projection_markers_fails_closed(tmp_path: Path) -> None:
+    config, signal, state = make_case(tmp_path)
+    write_signal(signal)
+    run_step(config)
+    (state / "execution_log.json").unlink()
+    for name in (
+        ".paper_commit_pending.json",
+        "projection_manifest.json",
+        "execution_artifacts.json",
+    ):
+        (state / name).unlink(missing_ok=True)
+    projection = json.loads((state / "portfolio.json").read_text(encoding="utf-8"))
+    projection["cash"] = 777
+    (state / "portfolio.json").write_text(json.dumps(projection), encoding="utf-8")
+
+    with pytest.raises(StateError, match="portfolio.json markers"):
+        status(config)
+    assert not (state / "execution_log.json").exists()
+
+
+@pytest.mark.parametrize("residue_name", ["projection_manifest.json", "execution_artifacts.json"])
+def test_missing_log_with_v2_projection_file_fails_closed(
+    tmp_path: Path, residue_name: str
+) -> None:
+    config, _, state = make_case(tmp_path)
+    state.mkdir()
+    (state / residue_name).write_text("{}", encoding="utf-8")
+    with pytest.raises(StateError, match="v2 state residue"):
+        status(config)
+    assert not (state / "execution_log.json").exists()
+
+
+def test_valid_pending_with_old_log_replays_and_repairs_projections(tmp_path: Path) -> None:
+    config, signal, state = make_case(tmp_path)
+    write_signal(signal)
+    expected = run_step(config).portfolio
+    projection = json.loads((state / "portfolio.json").read_text(encoding="utf-8"))
+    projection["cash"] = 777
+    (state / "portfolio.json").write_text(json.dumps(projection), encoding="utf-8")
+    (state / ".paper_commit_pending.json").write_text(
+        json.dumps(
+            {
+                "schema": "quant-paper-commit/1.0.0",
+                "target_authoritative_sha256": "0" * 64,
+                "files": [
+                    "execution_artifacts.json",
+                    "holdings.csv",
+                    "nav.csv",
+                    "portfolio.json",
+                    "trades.json",
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    replayed = status(config)
+    repaired = json.loads((state / "portfolio.json").read_text(encoding="utf-8"))
+    assert replayed.cash == expected.cash
+    assert repaired["cash"] == expected.cash
+    assert not (state / ".paper_commit_pending.json").exists()
+
+
 def test_cumulative_hash_tampering_and_malformed_legacy_json_fail_closed(tmp_path: Path) -> None:
     config, signal, state = make_case(tmp_path)
     write_signal(signal)
@@ -198,6 +289,27 @@ def test_status_requires_existing_state_and_rebalance_refuses_legacy_holdings(
                 targets=[TargetPosition("000002", 1, 10)],
             ),
         )
+
+
+def test_zero_cash_never_reopens_initial_capital(tmp_path: Path) -> None:
+    signals = SignalBundle(
+        as_of="2026-07-29",
+        targets=[TargetPosition("000002", 1, 10)],
+    )
+    with pytest.raises(StateError, match="initial_capital cannot recreate"):
+        rebalance(
+            PortfolioState(as_of="2026-07-28", cash=0, initial_capital=100_000),
+            signals,
+        )
+
+    config, _, state = make_case(tmp_path)
+    state.mkdir()
+    (state / "portfolio.json").write_text(
+        json.dumps({"as_of": "init", "cash": 0, "holdings": []}), encoding="utf-8"
+    )
+    with pytest.raises(StateError, match="initial_cash must be a positive"):
+        status(config)
+    assert not (state / "execution_log.json").exists()
 
 
 def test_legacy_projection_helpers_remain_compatible(tmp_path: Path) -> None:
@@ -248,6 +360,77 @@ def test_invalid_symbols_fail_closed(symbol: str) -> None:
         normalize(symbol)
 
 
+@pytest.mark.parametrize(
+    "symbol",
+    [
+        "920000",
+        "900901.SH",
+        "200002.SZ",
+        "399001.SZ",
+        "123001.SZ",
+        "131810.SZ",
+        "160706.SZ",
+        "184801.SZ",
+        "508000.SH",
+        "580000.SH",
+    ],
+)
+def test_out_of_scope_exchange_products_fail_closed(symbol: str) -> None:
+    with pytest.raises(StateError, match="outside certified profile"):
+        paper_engine.normalize_symbol(symbol)
+
+
+def test_negative_or_unreasonable_fee_rates_fail_before_state_changes(tmp_path: Path) -> None:
+    config, signal, state = make_case(tmp_path)
+    write_signal(signal)
+    raw = yaml.safe_load(config.read_text(encoding="utf-8"))
+    raw["commission_rate"] = -0.001
+    config.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    with pytest.raises(StateError, match="commission_rate must be in"):
+        run_step(config)
+    assert not (state / "execution_log.json").exists()
+
+    raw["commission_rate"] = 0.0003
+    raw["stamp_duty_rate"] = 0.0005
+    config.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    first = run_step(config)
+    log_before = (state / "execution_log.json").read_bytes()
+    artifacts_before = (state / "execution_artifacts.json").read_bytes()
+    write_signal(
+        signal,
+        as_of="2026-07-29",
+        targets=[{"symbol": "000002", "weight": 1, "price": 10}],
+    )
+    raw["stamp_duty_rate"] = -0.001
+    config.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    with pytest.raises(StateError, match="stamp_duty_rate must be in"):
+        run_step(config)
+    assert (state / "execution_log.json").read_bytes() == log_before
+    assert (state / "execution_artifacts.json").read_bytes() == artifacts_before
+
+    raw["stamp_duty_rate"] = 0.0005
+    config.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    assert status(config).nav == first.portfolio.nav
+    with pytest.raises(StateError, match="commission_rate must be in"):
+        rebalance(
+            PortfolioState(as_of="", cash=1000),
+            SignalBundle(
+                as_of="2026-07-29",
+                targets=[TargetPosition("000001", 1, 10)],
+            ),
+            commission_rate=0.1001,
+        )
+
+
+@pytest.mark.parametrize(
+    ("commission", "stamp", "field"),
+    [("NaN", "0.0005", "commission_rate"), ("0.0003", "Infinity", "stamp_duty_rate")],
+)
+def test_non_finite_fee_rates_fail_closed(commission: str, stamp: str, field: str) -> None:
+    with pytest.raises(StateError, match=f"{field} must be a finite decimal"):
+        instrument_spec("000001", commission_rate=commission, stamp_duty_rate=stamp)
+
+
 def test_desired_quantity_and_instrument_edge_rules() -> None:
     base = {
         "cash_reserve": "0.05",
@@ -289,8 +472,37 @@ def test_desired_quantity_and_instrument_edge_rules() -> None:
     equity = instrument_spec("600519", commission_rate="0.0003", stamp_duty_rate="0.0005")
     assert etf.asset_class is AssetClass.ETF
     assert etf.metadata["stamp_duty_rate"] == "0"
+    assert etf.price_tick.scale == 3
+    assert etf.price_tick.units == 1
     assert equity.asset_class is AssetClass.EQUITY
     assert equity.metadata["stamp_duty_rate"] == "0.0005"
+    assert equity.price_tick.scale == 2
+    assert equity.price_tick.units == 1
+
+
+def test_core_etfs_trade_at_three_decimals_and_replay_exactly(tmp_path: Path) -> None:
+    config, signal, state = make_case(tmp_path)
+    write_signal(
+        signal,
+        targets=[
+            {"symbol": "510300.SH", "weight": 0.5, "price": 3.927},
+            {"symbol": "159919.SZ", "weight": 0.5, "price": 4.123},
+        ],
+    )
+    first = run_step(config)
+    log_before = load_log(state / "execution_log.json")
+    artifacts = json.loads((state / "execution_artifacts.json").read_text(encoding="utf-8"))
+
+    assert {trade["symbol"] for trade in first.trades} == {"510300.SH", "159919.SZ"}
+    assert {row["price"]["scale"] for row in artifacts["fills"]} == {3}
+    assert {row["price"]["units"] for row in artifacts["fills"]} == {3927, 4123}
+    assert {row["price_scale"] for row in log_before["steps"][0]["targets"]} == {3}
+    assert status(config).to_dict() == first.portfolio.to_dict()
+    log_after = load_log(state / "execution_log.json")
+    assert log_after["content_sha256"] == log_before["content_sha256"]
+    assert (
+        log_after["steps"][-1]["cumulative_result"] == log_before["steps"][-1]["cumulative_result"]
+    )
 
 
 def test_compile_log_rejects_mapping_day_and_event_time_tampering(tmp_path: Path) -> None:
@@ -420,7 +632,7 @@ def test_state_path_properties_and_reader_failures(tmp_path: Path) -> None:
             regime_scale=1,
         )
     factor.write_text("symbol,date,score,close\n000001,2026-01-01,,10\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="null"):
+    with pytest.raises(ValueError, match="finite numeric"):
         load_factor_csv(
             factor,
             factor_column="score",
@@ -429,16 +641,100 @@ def test_state_path_properties_and_reader_failures(tmp_path: Path) -> None:
             cash_reserve=0.05,
             regime_scale=1,
         )
-    factor.write_text("symbol,date,score,close\n000001,2026-01-01,1,0\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="positive"):
+
+
+@pytest.mark.parametrize("top_n", [0, -1])
+def test_csv_top_n_must_be_positive_for_q5_and_factor(tmp_path: Path, top_n: int) -> None:
+    q5 = tmp_path / "q5_candidates_2026-01-01.csv"
+    q5.write_text("symbol,close\n000001,10\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="positive integer"):
+        load_q5_csv(q5, top_n, 0.05, 1)
+
+    factor = tmp_path / "factor.csv"
+    factor.write_text("symbol,date,score,close\n000001,2026-01-01,1,10\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="positive integer"):
         load_factor_csv(
             factor,
+            factor_column="score",
+            price_column="close",
+            top_n=top_n,
+            cash_reserve=0.05,
+            regime_scale=1,
+        )
+
+
+@pytest.mark.parametrize(
+    ("weights", "message"),
+    [
+        ("-1,1", "non-negative"),
+        ("0,0", "total must be positive"),
+        ("NaN,1", "finite numeric"),
+        ("Inf,1", "finite numeric"),
+    ],
+)
+def test_explicit_csv_weights_never_fall_back_to_equal_weight(
+    tmp_path: Path, weights: str, message: str
+) -> None:
+    first, second = weights.split(",")
+    q5 = tmp_path / "q5_candidates_2026-01-01.csv"
+    q5.write_text(
+        f"symbol,close,weight\n000001,10,{first}\n000002,20,{second}\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match=message):
+        load_q5_csv(q5, 2, 0.05, 1)
+
+    factor = tmp_path / "factor.csv"
+    factor.write_text(
+        "symbol,date,score,close,weight\n"
+        f"000001,2026-01-01,2,10,{first}\n"
+        f"000002,2026-01-01,1,20,{second}\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match=message):
+        load_factor_csv(
+            factor,
+            factor_column="score",
+            price_column="close",
+            top_n=2,
+            cash_reserve=0.05,
+            regime_scale=1,
+        )
+
+
+@pytest.mark.parametrize(
+    ("factor", "price", "message"),
+    [
+        ("NaN", "10", "finite numeric"),
+        ("Inf", "10", "finite numeric"),
+        ("1", "NaN", "finite numeric"),
+        ("1", "Inf", "finite numeric"),
+        ("1", "0", "positive"),
+    ],
+)
+def test_factor_and_price_columns_must_be_finite_and_price_positive(
+    tmp_path: Path, factor: str, price: str, message: str
+) -> None:
+    csv_path = tmp_path / "factor.csv"
+    csv_path.write_text(
+        f"symbol,date,score,close\n000001,2026-01-01,{factor},{price}\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match=message):
+        load_factor_csv(
+            csv_path,
             factor_column="score",
             price_column="close",
             top_n=1,
             cash_reserve=0.05,
             regime_scale=1,
         )
+
+    q5 = tmp_path / "q5_candidates_2026-01-01.csv"
+    q5.write_text(f"symbol,close\n000001,{price}\n", encoding="utf-8")
+    if price in {"NaN", "Inf", "0"}:
+        with pytest.raises(ValueError, match=message):
+            load_q5_csv(q5, 1, 0.05, 1)
 
 
 def test_reader_equal_weights_override_and_path_resolution(tmp_path: Path) -> None:

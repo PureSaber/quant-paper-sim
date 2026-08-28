@@ -32,13 +32,98 @@ from quant_execution import (
 from quant_paper_sim.state import StateError
 
 UTC = timezone.utc
-PRICE_SCALE = 2
 MONEY_SCALE = 8
 ACCOUNT_ID = "paper-account"
 STRATEGY_ID = "paper-rebalance-v2"
 RUN_ID = "quant-paper-v2"
 SEED = 42
+INSTRUMENT_PROFILE_VERSION = "cn-a-equity-core-etf-2026-08"
+MAX_PAPER_FEE_RATE = Decimal("0.1")
 _INSTRUMENT_AVAILABLE_AT = datetime(2000, 1, 1, tzinfo=UTC)
+
+
+@dataclass(frozen=True)
+class CertifiedInstrumentProfile:
+    """Conservative, auditable subset certified by this paper adapter."""
+
+    profile_id: str
+    venue: str
+    code_ranges: tuple[tuple[int, int], ...]
+    asset_class: AssetClass
+    price_scale: int
+    price_tick: str
+    lot: int
+    stamp_duty: bool
+
+    def accepts(self, code: str) -> bool:
+        value = int(code)
+        return any(lower <= value <= upper for lower, upper in self.code_ranges)
+
+
+# These deliberately conservative ranges are product profiles, not a general symbol guesser.
+# Out-of-scope exchange products are rejected even when their first digit resembles a profile.
+CERTIFIED_INSTRUMENT_PROFILES = (
+    CertifiedInstrumentProfile(
+        profile_id="sse-main-a-v1",
+        venue="XSHG",
+        code_ranges=((600000, 601999), (603000, 603999), (605000, 605999)),
+        asset_class=AssetClass.EQUITY,
+        price_scale=2,
+        price_tick="0.01",
+        lot=100,
+        stamp_duty=True,
+    ),
+    CertifiedInstrumentProfile(
+        profile_id="sse-star-a-v1",
+        venue="XSHG",
+        code_ranges=((688000, 689999),),
+        asset_class=AssetClass.EQUITY,
+        price_scale=2,
+        price_tick="0.01",
+        lot=200,
+        stamp_duty=True,
+    ),
+    CertifiedInstrumentProfile(
+        profile_id="szse-main-a-v1",
+        venue="XSHE",
+        code_ranges=((1, 3999),),
+        asset_class=AssetClass.EQUITY,
+        price_scale=2,
+        price_tick="0.01",
+        lot=100,
+        stamp_duty=True,
+    ),
+    CertifiedInstrumentProfile(
+        profile_id="szse-chinext-a-v1",
+        venue="XSHE",
+        code_ranges=((300000, 301999),),
+        asset_class=AssetClass.EQUITY,
+        price_scale=2,
+        price_tick="0.01",
+        lot=100,
+        stamp_duty=True,
+    ),
+    CertifiedInstrumentProfile(
+        profile_id="sse-core-etf-v1",
+        venue="XSHG",
+        code_ranges=((510000, 518999),),
+        asset_class=AssetClass.ETF,
+        price_scale=3,
+        price_tick="0.001",
+        lot=100,
+        stamp_duty=False,
+    ),
+    CertifiedInstrumentProfile(
+        profile_id="szse-core-etf-v1",
+        venue="XSHE",
+        code_ranges=((158000, 159999),),
+        asset_class=AssetClass.ETF,
+        price_scale=3,
+        price_tick="0.001",
+        lot=100,
+        stamp_duty=False,
+    ),
+)
 
 
 def decimal_value(value: object, field: str) -> Decimal:
@@ -58,6 +143,13 @@ def fixed(value: object, scale: int, field: str) -> FixedPoint:
         raise StateError(f"{field} is not exact at scale {scale}: {value!r}") from exc
 
 
+def validated_fee_rate(value: object, field: str) -> str:
+    rate = decimal_value(value, field)
+    if not Decimal(0) <= rate <= MAX_PAPER_FEE_RATE:
+        raise StateError(f"{field} must be in [0, {MAX_PAPER_FEE_RATE}]")
+    return format(rate, "f")
+
+
 def parse_as_of(value: str) -> tuple[datetime, date]:
     raw = str(value).strip()
     if not raw:
@@ -75,7 +167,7 @@ def parse_as_of(value: str) -> tuple[datetime, date]:
     return normalized, normalized.date()
 
 
-def normalize_symbol(symbol: str) -> tuple[str, str, str]:
+def certified_instrument_profile(symbol: str) -> tuple[str, CertifiedInstrumentProfile]:
     raw = str(symbol).strip().upper()
     if not raw:
         raise StateError("symbol is required")
@@ -86,35 +178,31 @@ def normalize_symbol(symbol: str) -> tuple[str, str, str]:
     suffix = parts[1] if len(parts) == 2 else ""
     if len(parts) > 2:
         raise StateError(f"unsupported A-share symbol: {symbol!r}")
-    if suffix in {"SH", "SS", "XSHG"}:
-        venue = "XSHG"
-    elif suffix in {"SZ", "XSHE"}:
-        venue = "XSHE"
-    elif suffix:
+    suffix_venues = {"SH": "XSHG", "SS": "XSHG", "XSHG": "XSHG", "SZ": "XSHE", "XSHE": "XSHE"}
+    if suffix and suffix not in suffix_venues:
         raise StateError(f"unsupported A-share venue suffix: {suffix!r}")
-    else:
-        if code.startswith(("5", "6", "9")):
-            venue = "XSHG"
-        elif code.startswith(("0", "1", "2", "3")):
-            venue = "XSHE"
-        else:
-            raise StateError(f"cannot infer a supported Shanghai/Shenzhen venue: {symbol!r}")
-    if venue == "XSHG" and not code.startswith(("5", "6", "9")):
-        raise StateError(f"symbol code is inconsistent with Shanghai venue: {symbol!r}")
-    if venue == "XSHE" and not code.startswith(("0", "1", "2", "3")):
-        raise StateError(f"symbol code is inconsistent with Shenzhen venue: {symbol!r}")
+    venue = suffix_venues.get(suffix)
+    matches = [
+        profile
+        for profile in CERTIFIED_INSTRUMENT_PROFILES
+        if (venue is None or profile.venue == venue) and profile.accepts(code)
+    ]
+    if len(matches) != 1:
+        raise StateError(
+            f"symbol is outside certified profile {INSTRUMENT_PROFILE_VERSION}: {symbol!r}"
+        )
+    return code, matches[0]
+
+
+def normalize_symbol(symbol: str) -> tuple[str, str, str]:
+    code, profile = certified_instrument_profile(symbol)
+    venue = profile.venue
     return code, venue, f"CN.{venue}.{code}"
 
 
 def lot_size(symbol: str) -> int:
-    code, _, _ = normalize_symbol(symbol)
-    return 200 if code.startswith(("688", "689")) else 100
-
-
-def _asset_class(code: str) -> AssetClass:
-    if code.startswith(("15", "16", "18", "50", "51", "52", "53", "56", "58")):
-        return AssetClass.ETF
-    return AssetClass.EQUITY
+    _, profile = certified_instrument_profile(symbol)
+    return profile.lot
 
 
 def instrument_spec(
@@ -123,29 +211,34 @@ def instrument_spec(
     commission_rate: str,
     stamp_duty_rate: str,
 ) -> InstrumentSpec:
-    code, venue, instrument_id = normalize_symbol(symbol)
-    lot = lot_size(symbol)
-    asset_class = _asset_class(code)
+    commission_rate = validated_fee_rate(commission_rate, "commission_rate")
+    stamp_duty_rate = validated_fee_rate(stamp_duty_rate, "stamp_duty_rate")
+    code, profile = certified_instrument_profile(symbol)
+    venue = profile.venue
+    instrument_id = f"CN.{venue}.{code}"
     return InstrumentSpec(
         instrument_id=instrument_id,
-        asset_class=asset_class,
+        asset_class=profile.asset_class,
         product_type="cn_a_share_paper",
         venue=venue,
         native_symbol=f"{code}.{venue}",
         base_currency=None,
         quote_currency="CNY",
         settlement_currency="CNY",
-        price_tick=fixed("0.01", PRICE_SCALE, "price_tick"),
-        quantity_step=fixed(lot, 0, "quantity_step"),
+        price_tick=fixed(profile.price_tick, profile.price_scale, "price_tick"),
+        quantity_step=fixed(profile.lot, 0, "quantity_step"),
         contract_multiplier=fixed(1, 0, "contract_multiplier"),
         calendar_id="CN-A-SHARE",
         margin_mode=MarginMode.NONE,
         effective_from=_INSTRUMENT_AVAILABLE_AT,
         available_at=_INSTRUMENT_AVAILABLE_AT,
         metadata={
-            "lot_size": str(lot),
+            "instrument_profile": INSTRUMENT_PROFILE_VERSION,
+            "profile_id": profile.profile_id,
+            "price_scale": str(profile.price_scale),
+            "lot_size": str(profile.lot),
             "commission_rate": commission_rate,
-            "stamp_duty_rate": "0" if asset_class is AssetClass.ETF else stamp_duty_rate,
+            "stamp_duty_rate": stamp_duty_rate if profile.stamp_duty else "0",
             "market_data_mode": "paper_research_close_not_live",
         },
     )
@@ -227,8 +320,9 @@ def _bar(
     phase: str,
     volume: int = 0,
     source_detail: str = "current_signal_close",
+    price_scale: int,
 ) -> BarEvent:
-    price_value = fixed(price, PRICE_SCALE, f"{event_id}.price")
+    price_value = fixed(price, price_scale, f"{event_id}.price")
     return BarEvent(
         event_id=event_id,
         instrument_id=instrument_id,
@@ -258,6 +352,7 @@ def _intent(
     side: Side,
     quantity: int,
     price: Decimal,
+    price_scale: int,
 ) -> OrderIntent:
     return OrderIntent(
         idempotency_key=f"paper:{step_hash}:{side.value}:{instrument_id}",
@@ -269,7 +364,7 @@ def _intent(
         order_type=OrderType.LIMIT,
         time_in_force=TimeInForce.GTC,
         created_at=event.available_at,
-        limit_price=fixed(price, PRICE_SCALE, "order.limit_price"),
+        limit_price=fixed(price, price_scale, "order.limit_price"),
         reduce_only=False,
     )
 
@@ -304,17 +399,32 @@ def _desired_quantities(step: dict[str, Any], nav: Decimal) -> dict[str, int]:
 
 def compile_log(log: dict[str, Any]) -> CompiledReplay:
     config = log["execution_config"]
-    commission = str(config["commission_rate"])
-    stamp = str(config["stamp_duty_rate"])
+    if config.get("instrument_profile") != INSTRUMENT_PROFILE_VERSION:
+        raise StateError("authoritative log uses an unsupported instrument profile")
+    commission = validated_fee_rate(config["commission_rate"], "commission_rate")
+    stamp = validated_fee_rate(config["stamp_duty_rate"], "stamp_duty_rate")
     registry: dict[str, InstrumentSpec] = {}
     instrument_symbols: dict[str, str] = {}
     for step in log["steps"]:
         for row in step["targets"]:
             spec = instrument_spec(row["symbol"], commission_rate=commission, stamp_duty_rate=stamp)
-            if spec.instrument_id != row["instrument_id"] or int(row["lot_size"]) != int(
-                spec.metadata["lot_size"]
-            ):
-                raise StateError("persisted target instrument mapping does not match v1 rules")
+            expected_scale = int(spec.metadata["price_scale"])
+            expected_fixed = fixed(row["price"], expected_scale, "target.price")
+            persisted_fixed = row.get("price_fixed")
+            mapping_matches = (
+                spec.instrument_id == row.get("instrument_id")
+                and spec.native_symbol == row.get("native_symbol")
+                and int(row.get("lot_size", -1)) == int(spec.metadata["lot_size"])
+                and row.get("profile_id") == spec.metadata["profile_id"]
+                and int(row.get("price_scale", -1)) == expected_scale
+                and isinstance(persisted_fixed, dict)
+                and persisted_fixed.get("units") == expected_fixed.units
+                and persisted_fixed.get("scale") == expected_fixed.scale
+            )
+            if not mapping_matches:
+                raise StateError(
+                    "persisted target instrument mapping does not match certified rules"
+                )
             registry[spec.instrument_id] = spec
             instrument_symbols[spec.instrument_id] = row["symbol"]
 
@@ -375,6 +485,7 @@ def compile_log(log: dict[str, Any]) -> CompiledReplay:
                 sequence=sequence,
                 phase="mark",
                 source_detail=source_detail,
+                price_scale=int(registry[instrument_id].metadata["price_scale"]),
             )
             events.append(event)
             step_event_ids.append(event.event_id)
@@ -405,6 +516,7 @@ def compile_log(log: dict[str, Any]) -> CompiledReplay:
             sequence=sequence,
             phase="submit-sell",
             source_detail=latest_price_sources[anchor],
+            price_scale=int(registry[anchor].metadata["price_scale"]),
         )
         events.append(submit_sell)
         step_event_ids.append(submit_sell.event_id)
@@ -416,6 +528,7 @@ def compile_log(log: dict[str, Any]) -> CompiledReplay:
                 side=Side.SELL,
                 quantity=quantity,
                 price=latest_prices[instrument_id],
+                price_scale=int(registry[instrument_id].metadata["price_scale"]),
             )
             for instrument_id, quantity in sorted(sell_quantities.items())
         )
@@ -432,6 +545,7 @@ def compile_log(log: dict[str, Any]) -> CompiledReplay:
                 phase="fill-sell",
                 volume=quantity,
                 source_detail=latest_price_sources[instrument_id],
+                price_scale=int(registry[instrument_id].metadata["price_scale"]),
             )
             events.append(event)
             step_event_ids.append(event.event_id)
@@ -461,6 +575,7 @@ def compile_log(log: dict[str, Any]) -> CompiledReplay:
             sequence=sequence,
             phase="submit-buy",
             source_detail=latest_price_sources[anchor],
+            price_scale=int(registry[anchor].metadata["price_scale"]),
         )
         events.append(submit_buy)
         step_event_ids.append(submit_buy.event_id)
@@ -472,6 +587,7 @@ def compile_log(log: dict[str, Any]) -> CompiledReplay:
                 side=Side.BUY,
                 quantity=quantity,
                 price=latest_prices[instrument_id],
+                price_scale=int(registry[instrument_id].metadata["price_scale"]),
             )
             for instrument_id, quantity in sorted(buy_quantities.items())
         )
@@ -488,6 +604,7 @@ def compile_log(log: dict[str, Any]) -> CompiledReplay:
                 phase="fill-buy",
                 volume=quantity,
                 source_detail=latest_price_sources[instrument_id],
+                price_scale=int(registry[instrument_id].metadata["price_scale"]),
             )
             events.append(event)
             step_event_ids.append(event.event_id)
