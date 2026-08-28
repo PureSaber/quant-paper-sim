@@ -1,75 +1,576 @@
+"""Public paper-sim API backed exclusively by quant-execution replay."""
+
 from __future__ import annotations
 
+import csv
+import hashlib
+import io
 import json
+from copy import deepcopy
+from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
-import pandas as pd
+from quant_data_kit import dataclass_payload
+from quant_execution import execution_payload
 
+from quant_paper_sim.execution import (
+    MONEY_SCALE,
+    CompiledReplay,
+    artifact_payloads,
+    compile_log,
+    decimal_value,
+    fixed,
+    instrument_spec,
+    parse_as_of,
+    validated_fee_rate,
+)
+from quant_paper_sim.execution import normalize_symbol as _normalize_symbol
+from quant_paper_sim.instrument_catalog import (
+    INSTRUMENT_RULE_PROFILE_VERSION,
+    InstrumentCatalog,
+    load_bundled_catalog,
+    load_configured_catalog,
+)
 from quant_paper_sim.models import Holding, PortfolioState, RebalanceResult, SignalBundle
+from quant_paper_sim.state import (
+    PENDING_FILE,
+    StateError,
+    StatePaths,
+    atomic_write_bytes,
+    atomic_write_json,
+    file_sha256,
+    load_log,
+    new_log,
+    seal_log,
+    sha256_payload,
+    step_input_payload,
+    validate_log,
+)
+
+_PROJECTION_FILES = (
+    "execution_artifacts.json",
+    "holdings.csv",
+    "nav.csv",
+    "portfolio.json",
+    "trades.json",
+)
+_V2_PORTFOLIO_MARKERS = {
+    "authoritative",
+    "execution_log_sha256",
+    "_execution",
+    "authoritative_sha256",
+}
 
 
-def _lot_size(symbol: str) -> int:
-    code = symbol.split(".")[0] if "." in symbol else symbol
-    if code.startswith(("688", "689")):
-        return 200
-    return 100
+def _state_paths(config_path: Path, cfg: dict[str, Any]) -> StatePaths:
+    repo_root = config_path.resolve().parent.parent
+    state_dir = Path(str(cfg.get("state_dir", "state")))
+    if not state_dir.is_absolute():
+        state_dir = repo_root / state_dir
+    return StatePaths(state_dir.resolve())
 
 
-def _floor_lots(shares: float, lot: int) -> int:
-    if shares <= 0:
-        return 0
-    return int(shares // lot) * lot
+def _execution_config(cfg: dict[str, Any], catalog: InstrumentCatalog) -> dict[str, object]:
+    policy = str(cfg.get("stale_exit_price_policy", "last_known_signal_close"))
+    if policy != "last_known_signal_close":
+        raise StateError("stale_exit_price_policy must be 'last_known_signal_close'")
+    profile = str(cfg.get("instrument_rule_profile", ""))
+    if profile != INSTRUMENT_RULE_PROFILE_VERSION:
+        raise StateError(f"instrument_rule_profile must be {INSTRUMENT_RULE_PROFILE_VERSION!r}")
+    return {
+        "commission_rate": validated_fee_rate(
+            cfg.get("commission_rate", "0.0003"), "commission_rate"
+        ),
+        "stamp_duty_rate": validated_fee_rate(
+            cfg.get("stamp_duty_rate", "0.0005"), "stamp_duty_rate"
+        ),
+        "instrument_rule_profile": profile,
+        "instrument_catalog": catalog.execution_identity,
+        "price_precision": "per_instrument_spec",
+        "money_scale": MONEY_SCALE,
+        "bar_participation_rate": "1",
+        "slippage_ticks": 0,
+        "seed": 42,
+        "market_data_mode": "paper_research_close_not_live",
+        "stale_exit_price_policy": policy,
+    }
 
 
-def load_portfolio(path: Path, initial_capital: float) -> PortfolioState:
-    if not path.is_file():
-        return PortfolioState(as_of="", cash=initial_capital, holdings=[], initial_capital=initial_capital)
-    data = json.loads(path.read_text(encoding="utf-8"))
+def _assert_config_compatible(
+    log: dict[str, Any], cfg: dict[str, Any], catalog: InstrumentCatalog
+) -> None:
+    if log["execution_config"] != _execution_config(cfg, catalog):
+        raise StateError(
+            "execution configuration differs from the authoritative log; "
+            "run quant-paper init to start a new state"
+        )
+
+
+def _source_provenance(cfg: dict[str, Any], config_path: Path) -> dict[str, str]:
+    from quant_paper_sim.readers.signals import resolve_data_path
+
+    signal_cfg = cfg.get("signals") or {}
+    if "path" not in signal_cfg:
+        raise StateError("signals.path is required")
+    source_path = resolve_data_path(str(signal_cfg["path"]), config_path)
+    if not source_path.is_file():
+        raise StateError(f"signal source does not exist: {source_path}")
+    return {
+        "kind": str(signal_cfg.get("source", "yaml")),
+        "path": str(source_path.resolve()),
+        "sha256": file_sha256(source_path),
+        "market_data_semantics": "paper_research_close_not_live",
+    }
+
+
+def _step_record(
+    signals: SignalBundle,
+    *,
+    source: dict[str, str],
+    catalog: InstrumentCatalog,
+    execution_config: dict[str, object],
+) -> dict[str, Any]:
+    at, trading_day = parse_as_of(signals.as_of)
+    targets: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for target in signals.targets:
+        spec = instrument_spec(
+            target.symbol,
+            commission_rate=str(execution_config["commission_rate"]),
+            stamp_duty_rate=str(execution_config["stamp_duty_rate"]),
+            catalog=catalog,
+            observation_time=at,
+            as_of_time=at,
+        )
+        code = spec.native_symbol.split(".", 1)[0]
+        venue = spec.venue
+        instrument_id = spec.instrument_id
+        if instrument_id in seen:
+            raise StateError(f"duplicate target instrument: {instrument_id}")
+        seen.add(instrument_id)
+        price_scale = int(spec.metadata["price_scale"])
+        price_fixed = fixed(target.price, price_scale, f"target[{target.symbol}].price")
+        price = price_fixed.to_decimal()
+        weight = decimal_value(target.weight, f"target[{target.symbol}].weight")
+        if weight < 0:
+            raise StateError("target weights must be non-negative")
+        targets.append(
+            {
+                "symbol": str(target.symbol).strip(),
+                "native_symbol": f"{code}.{venue}",
+                "instrument_id": instrument_id,
+                "weight": format(weight, "f"),
+                "price": format(price, "f"),
+                "price_fixed": {"units": price_fixed.units, "scale": price_fixed.scale},
+                "price_scale": price_scale,
+                "rule_profile_id": spec.metadata["rule_profile_id"],
+                "lot_size": int(spec.metadata["lot_size"]),
+                "instrument_spec_sha256": sha256_payload(dataclass_payload(spec)),
+            }
+        )
+    if not targets:
+        raise StateError("signal targets are empty")
+    step: dict[str, Any] = {
+        "as_of": at.isoformat(),
+        "trading_day": trading_day.isoformat(),
+        "signal_source": source,
+        "targets": sorted(targets, key=lambda item: item["instrument_id"]),
+        "regime_scale": format(decimal_value(signals.regime_scale, "regime_scale"), "f"),
+        "cash_reserve": format(decimal_value(signals.cash_reserve, "cash_reserve"), "f"),
+    }
+    step["input_sha256"] = sha256_payload(step_input_payload(step))
+    return step
+
+
+def _validate_replay_evidence(log: dict[str, Any], compiled: CompiledReplay) -> None:
+    if len(log["steps"]) != len(compiled.steps):
+        raise StateError("compiled step count differs from authoritative log")
+    for persisted, view in zip(log["steps"], compiled.steps, strict=True):
+        evidence = persisted.get("replay_evidence")
+        if evidence is not None and evidence.get("fill_ids") != list(view.fill_ids):
+            raise StateError(f"replayed fills differ at {persisted['as_of']}")
+    if log["steps"]:
+        expected = log["steps"][-1].get("cumulative_result")
+        artifacts = compiled.runtime.engine.artifacts
+        if artifacts is None:
+            raise StateError("quant-execution did not produce replay artifacts")
+        actual = execution_payload(artifacts.result)
+        if expected is not None and expected != actual:
+            raise StateError("replayed order/fill/ledger hashes differ from authoritative evidence")
+
+
+def normalize_symbol(symbol: str) -> tuple[str, str, str]:
+    """Compatibility export backed by the bundled fixture-certified catalog."""
+
+    return _normalize_symbol(symbol)
+
+
+def _compile(log: dict[str, Any], catalog: InstrumentCatalog | None = None) -> CompiledReplay:
+    active_catalog = catalog if catalog is not None else load_bundled_catalog()
+    validated = validate_log(log)
+    compiled = compile_log(validated, catalog=active_catalog)
+    _validate_replay_evidence(validated, compiled)
+    if (
+        compiled.runtime.engine.sends_live_orders
+        or compiled.runtime.engine.broker.sends_live_orders
+    ):
+        raise StateError("live order path is forbidden")
+    return compiled
+
+
+def _portfolio_from(compiled: CompiledReplay, log: dict[str, Any], as_of: str) -> PortfolioState:
+    snapshot = compiled.runtime.snapshot
+    cash = snapshot.cash_balances.get("CNY")
     holdings = [
-        Holding(symbol=h["symbol"], shares=int(h["shares"]), price=float(h["price"]))
-        for h in data.get("holdings") or []
+        Holding(
+            symbol=compiled.instrument_symbols[instrument_id],
+            shares=int(quantity.to_decimal()),
+            price=float(compiled.latest_prices[instrument_id]),
+        )
+        for instrument_id, quantity in sorted(snapshot.positions.items())
+        if quantity.units != 0
     ]
     return PortfolioState(
-        as_of=str(data.get("as_of", "")),
-        cash=float(data.get("cash", initial_capital)),
+        as_of=as_of,
+        cash=float(cash.to_decimal() if cash is not None else Decimal(0)),
         holdings=holdings,
-        initial_capital=float(data.get("initial_capital", initial_capital)),
+        initial_capital=float(decimal_value(log["initial_cash"], "initial_cash")),
+        authoritative=True,
+        execution_log_sha256=log["content_sha256"],
     )
 
 
-def save_portfolio(path: Path, portfolio: PortfolioState) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(portfolio.to_dict(), indent=2), encoding="utf-8")
+def _latest_trades(compiled: CompiledReplay) -> list[dict[str, Any]]:
+    if not compiled.steps:
+        return []
+    fill_ids = set(compiled.steps[-1].fill_ids)
+    artifacts = compiled.runtime.engine.artifacts
+    if artifacts is None:
+        return []
+    fees = {fee.fill_id: fee for fee in artifacts.fees}
+    rows: list[dict[str, Any]] = []
+    for fill in artifacts.fills:
+        if fill.fill_id not in fill_ids:
+            continue
+        fee = fees.get(fill.fill_id)
+        rows.append(
+            {
+                "symbol": compiled.instrument_symbols[fill.instrument_id],
+                "instrument_id": fill.instrument_id,
+                "side": fill.side.value,
+                "shares": int(fill.quantity.to_decimal()),
+                "price": float(fill.price.to_decimal()),
+                "fee": float(fee.amount.to_decimal()) if fee is not None else 0.0,
+                "fill_id": fill.fill_id,
+                "order_id": fill.order_id,
+                "event_time": fill.event_time.isoformat(),
+                "source": "quant-execution actual fill",
+            }
+        )
+    return rows
 
 
-def append_nav(nav_path: Path, portfolio: PortfolioState) -> None:
-    nav_path.parent.mkdir(parents=True, exist_ok=True)
-    row = {"date": portfolio.as_of, "nav": portfolio.nav, "cash": portfolio.cash}
-    if nav_path.is_file():
-        df = pd.read_csv(nav_path)
-        df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
-    else:
-        df = pd.DataFrame([row])
-    df.to_csv(nav_path, index=False)
+def _csv_bytes(fieldnames: list[str], rows: list[dict[str, object]]) -> bytes:
+    output = io.StringIO(newline="")
+    writer = csv.DictWriter(output, fieldnames=fieldnames, lineterminator="\n")
+    writer.writeheader()
+    writer.writerows(rows)
+    return output.getvalue().encode("utf-8")
 
 
-def write_holdings_csv(path: Path, portfolio: PortfolioState) -> None:
-    if portfolio.nav <= 0:
-        weights = []
-    else:
-        weights = [h.market_value / portfolio.nav for h in portfolio.holdings]
-    rows = [
-        {
-            "symbol": h.symbol,
-            "shares": h.shares,
-            "price": h.price,
-            "market_value": h.market_value,
-            "weight": w,
-        }
-        for h, w in zip(portfolio.holdings, weights, strict=False)
-    ]
-    path.parent.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(rows).to_csv(path, index=False)
+def _projection_bytes(
+    compiled: CompiledReplay,
+    log: dict[str, Any],
+    portfolio: PortfolioState,
+    trades: list[dict[str, Any]],
+) -> dict[str, bytes]:
+    portfolio_payload = portfolio.to_dict()
+    artifacts = artifact_payloads(compiled)
+    run_artifacts = compiled.runtime.engine.artifacts
+    result = execution_payload(run_artifacts.result) if run_artifacts is not None else None
+    portfolio_payload["_execution"] = {
+        "authoritative_log": "execution_log.json",
+        "authoritative_sha256": log["content_sha256"],
+        "quant_execution_version": log["quant_execution_version"],
+        "market_data_mode": "paper_research_close_not_live",
+        "run_result": result,
+    }
+    nav_rows: list[dict[str, object]] = []
+    for step, view in zip(log["steps"], compiled.steps, strict=True):
+        snapshot = view.snapshot
+        cash = snapshot.cash_balances.get("CNY")
+        nav_rows.append(
+            {
+                "date": step["as_of"],
+                "nav": format(snapshot.nav.to_decimal(), "f"),
+                "cash": format(cash.to_decimal() if cash is not None else Decimal(0), "f"),
+            }
+        )
+    holding_rows: list[dict[str, object]] = []
+    for holding in portfolio.holdings:
+        market_value = Decimal(holding.shares) * Decimal(str(holding.price))
+        holding_rows.append(
+            {
+                "symbol": holding.symbol,
+                "shares": holding.shares,
+                "price": format(Decimal(str(holding.price)), "f"),
+                "market_value": format(market_value, "f"),
+                "weight": (
+                    format(market_value / Decimal(str(portfolio.nav)), "f")
+                    if portfolio.nav > 0
+                    else "0"
+                ),
+            }
+        )
+    return {
+        "portfolio.json": json.dumps(portfolio_payload, indent=2, ensure_ascii=False).encode(
+            "utf-8"
+        ),
+        "nav.csv": _csv_bytes(["date", "nav", "cash"], nav_rows),
+        "holdings.csv": _csv_bytes(
+            ["symbol", "shares", "price", "market_value", "weight"], holding_rows
+        ),
+        "trades.json": json.dumps(trades, indent=2, ensure_ascii=False).encode("utf-8"),
+        "execution_artifacts.json": json.dumps(
+            {"authoritative_sha256": log["content_sha256"], **artifacts},
+            indent=2,
+            ensure_ascii=False,
+        ).encode("utf-8"),
+    }
+
+
+def _commit(
+    paths: StatePaths,
+    log: dict[str, Any],
+    compiled: CompiledReplay,
+    portfolio: PortfolioState,
+    trades: list[dict[str, Any]],
+) -> None:
+    sealed = validate_log(log)
+    projections = _projection_bytes(compiled, sealed, portfolio, trades)
+    paths.root.mkdir(parents=True, exist_ok=True)
+    pending = {
+        "schema": "quant-paper-commit/1.0.0",
+        "target_authoritative_sha256": sealed["content_sha256"],
+        "files": sorted(projections),
+    }
+    atomic_write_json(paths.pending, pending)
+    for name, data in projections.items():
+        atomic_write_bytes(paths.root / name, data)
+    manifest = {
+        "schema": "quant-paper-projections/1.0.0",
+        "authoritative_sha256": sealed["content_sha256"],
+        "files": {
+            name: hashlib.sha256(data).hexdigest() for name, data in sorted(projections.items())
+        },
+    }
+    atomic_write_json(paths.projection_manifest, manifest)
+    atomic_write_json(paths.log, sealed)
+    paths.pending.unlink(missing_ok=True)
+
+
+def _validate_pending_marker(paths: StatePaths) -> dict[str, Any] | None:
+    if not paths.pending.exists():
+        return None
+    if not paths.pending.is_file():
+        raise StateError(f"damaged pending commit marker {PENDING_FILE}: not a regular file")
+    try:
+        pending = json.loads(paths.pending.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise StateError(f"damaged pending commit marker {PENDING_FILE}: {exc}") from exc
+    expected_keys = {"schema", "target_authoritative_sha256", "files"}
+    target = pending.get("target_authoritative_sha256") if isinstance(pending, dict) else None
+    valid_hash = (
+        isinstance(target, str)
+        and len(target) == 64
+        and all(character in "0123456789abcdef" for character in target)
+    )
+    if (
+        not isinstance(pending, dict)
+        or set(pending) != expected_keys
+        or pending.get("schema") != "quant-paper-commit/1.0.0"
+        or pending.get("files") != list(_PROJECTION_FILES)
+        or not valid_hash
+    ):
+        raise StateError("damaged pending commit marker")
+    return pending
+
+
+def _read_legacy_portfolio(paths: StatePaths) -> dict[str, Any]:
+    try:
+        legacy = json.loads(paths.portfolio.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise StateError(f"legacy portfolio cannot be read for migration: {exc}") from exc
+    if not isinstance(legacy, dict):
+        raise StateError("legacy portfolio must be a JSON object")
+    return legacy
+
+
+def _assert_no_v2_residue_without_log(paths: StatePaths, pending: dict[str, Any] | None) -> None:
+    residue: list[str] = []
+    if pending is not None:
+        residue.append(PENDING_FILE)
+    if paths.projection_manifest.exists():
+        residue.append(paths.projection_manifest.name)
+    if paths.execution_artifacts.exists():
+        residue.append(paths.execution_artifacts.name)
+    if paths.portfolio.is_file():
+        portfolio = _read_legacy_portfolio(paths)
+        markers = sorted(_V2_PORTFOLIO_MARKERS & portfolio.keys())
+        if markers:
+            residue.append(f"portfolio.json markers={markers}")
+    if residue:
+        raise StateError(
+            "authoritative execution log is missing while v2 state residue exists "
+            f"({', '.join(residue)}); do not trust projections or recreate the log—"
+            "restore execution_log.json from backup or archive the state directory and run init"
+        )
+
+
+def _legacy_cash_only_log(
+    paths: StatePaths, cfg: dict[str, Any], catalog: InstrumentCatalog
+) -> dict[str, Any]:
+    if not paths.portfolio.is_file():
+        raise StateError(
+            "authoritative execution log is missing; run quant-paper init --config <path>"
+        )
+    legacy = _read_legacy_portfolio(paths)
+    holdings = legacy.get("holdings") or []
+    if any(int(row.get("shares", 0)) != 0 for row in holdings):
+        raise StateError(
+            "legacy portfolio contains holdings and cannot be migrated losslessly; "
+            "archive the state directory, then run quant-paper init"
+        )
+    if "cash" not in legacy:
+        raise StateError(
+            "legacy cash-only portfolio has no explicit cash; archive the state directory, "
+            "then run quant-paper init"
+        )
+    return new_log(
+        initial_cash=legacy["cash"],
+        execution_config=_execution_config(cfg, catalog),
+        migration={
+            "kind": "legacy_cash_only",
+            "source": "portfolio.json",
+            "source_sha256": file_sha256(paths.portfolio),
+        },
+    )
+
+
+def _load_or_migrate(
+    paths: StatePaths,
+    cfg: dict[str, Any],
+    catalog: InstrumentCatalog,
+    *,
+    initial_capital: float,
+    allow_fresh_step_bootstrap: bool = False,
+) -> dict[str, Any]:
+    pending = _validate_pending_marker(paths)
+    if paths.log.exists() and not paths.log.is_file():
+        raise StateError("authoritative execution log path is not a regular file")
+    if paths.log.is_file():
+        log = load_log(paths.log)
+        _assert_config_compatible(log, cfg, catalog)
+        return log
+    _assert_no_v2_residue_without_log(paths, pending)
+    if allow_fresh_step_bootstrap and not paths.portfolio.is_file():
+        return new_log(
+            initial_cash=initial_capital,
+            execution_config=_execution_config(cfg, catalog),
+            migration={"kind": "fresh_step_bootstrap", "source": "quant-paper step"},
+        )
+    return _legacy_cash_only_log(paths, cfg, catalog)
+
+
+def initialize(config_path: Path) -> RebalanceResult:
+    from quant_paper_sim.readers.signals import load_config
+
+    cfg = load_config(config_path)
+    catalog = load_configured_catalog(cfg, config_path)
+    paths = _state_paths(config_path, cfg)
+    initial_capital = float(cfg.get("initial_capital", 100_000))
+    log = new_log(
+        initial_cash=initial_capital,
+        execution_config=_execution_config(cfg, catalog),
+    )
+    compiled = _compile(log, catalog)
+    portfolio = _portfolio_from(compiled, log, "init")
+    result = RebalanceResult(portfolio=portfolio, trades=[])
+    _commit(paths, log, compiled, portfolio, [])
+    return result
+
+
+def status(config_path: Path) -> PortfolioState:
+    from quant_paper_sim.readers.signals import load_config
+
+    cfg = load_config(config_path)
+    catalog = load_configured_catalog(cfg, config_path)
+    paths = _state_paths(config_path, cfg)
+    initial_capital = float(cfg.get("initial_capital", 100_000))
+    log = _load_or_migrate(paths, cfg, catalog, initial_capital=initial_capital)
+    compiled = _compile(log, catalog)
+    as_of = log["steps"][-1]["as_of"] if log["steps"] else "init"
+    portfolio = _portfolio_from(compiled, log, as_of)
+    trades = _latest_trades(compiled)
+    _commit(paths, log, compiled, portfolio, trades)
+    return portfolio
+
+
+def run_step(config_path: Path) -> RebalanceResult:
+    from quant_paper_sim.readers.signals import load_config, load_signals
+
+    cfg = load_config(config_path)
+    catalog = load_configured_catalog(cfg, config_path)
+    execution_config = _execution_config(cfg, catalog)
+    paths = _state_paths(config_path, cfg)
+    initial_capital = float(cfg.get("initial_capital", 100_000))
+    log = _load_or_migrate(
+        paths,
+        cfg,
+        catalog,
+        initial_capital=initial_capital,
+        allow_fresh_step_bootstrap=True,
+    )
+    source = _source_provenance(cfg, config_path)
+    signals = load_signals(cfg, config_path)
+    step = _step_record(
+        signals,
+        source=source,
+        catalog=catalog,
+        execution_config=execution_config,
+    )
+
+    matching = [item for item in log["steps"] if item["as_of"] == step["as_of"]]
+    if matching:
+        if matching[0]["input_sha256"] != step["input_sha256"]:
+            raise StateError("conflicting paper step content for the same as_of")
+        compiled = _compile(log, catalog)
+        portfolio = _portfolio_from(compiled, log, step["as_of"])
+        trades = _latest_trades(compiled)
+        _commit(paths, log, compiled, portfolio, trades)
+        return RebalanceResult(portfolio=portfolio, trades=trades)
+    if log["steps"] and step["as_of"] <= log["steps"][-1]["as_of"]:
+        raise StateError("paper steps must be appended in strictly increasing as_of order")
+
+    candidate = deepcopy(log)
+    candidate["steps"].append(step)
+    candidate = seal_log(candidate)
+    compiled = compile_log(candidate, catalog=catalog)
+    artifacts = compiled.runtime.engine.artifacts
+    if artifacts is None:
+        raise StateError("quant-execution did not produce artifacts")
+    candidate["steps"][-1]["replay_evidence"] = {
+        "fill_ids": list(compiled.steps[-1].fill_ids),
+        "event_ids": list(compiled.steps[-1].event_ids),
+    }
+    candidate["steps"][-1]["cumulative_result"] = execution_payload(artifacts.result)
+    candidate = seal_log(candidate)
+    compiled = _compile(candidate, catalog)
+    portfolio = _portfolio_from(compiled, candidate, step["as_of"])
+    trades = _latest_trades(compiled)
+    _commit(paths, candidate, compiled, portfolio, trades)
+    return RebalanceResult(portfolio=portfolio, trades=trades)
 
 
 def rebalance(
@@ -78,79 +579,99 @@ def rebalance(
     *,
     commission_rate: float = 0.0003,
 ) -> RebalanceResult:
-    nav = portfolio.nav if portfolio.nav > 0 else portfolio.initial_capital or portfolio.cash
-    investable = nav * (1.0 - signals.cash_reserve) * signals.regime_scale
-    targets = signals.targets
-    if not targets:
-        raise ValueError("signal targets are empty")
+    """Compatibility API; cash-only input is executed through quant-execution."""
 
-    total_w = sum(t.weight for t in targets)
-    if total_w <= 0:
-        raise ValueError("target weights must sum to a positive value")
-
-    desired: dict[str, Holding] = {}
-    trades: list[dict] = []
-    spent = 0.0
-
-    for t in targets:
-        norm_w = t.weight / total_w
-        budget = investable * norm_w
-        lot = _lot_size(t.symbol)
-        shares = _floor_lots(budget / t.price, lot)
-        if shares <= 0:
-            continue
-        cost = shares * t.price
-        fee = cost * commission_rate
-        spent += cost + fee
-        desired[t.symbol] = Holding(symbol=t.symbol, shares=shares, price=t.price)
-        trades.append(
-            {
-                "symbol": t.symbol,
-                "side": "buy",
-                "shares": shares,
-                "price": t.price,
-                "fee": round(fee, 4),
-            }
+    if portfolio.holdings:
+        raise StateError(
+            "rebalance compatibility input with holdings cannot be migrated losslessly; "
+            "use run_step with an authoritative execution log"
         )
-
-    cash = max(nav - spent, 0.0)
-    new_portfolio = PortfolioState(
-        as_of=signals.as_of,
-        cash=round(cash, 2),
-        holdings=sorted(desired.values(), key=lambda h: h.symbol),
-        initial_capital=portfolio.initial_capital or nav,
+    initial = decimal_value(portfolio.cash, "portfolio.cash")
+    if initial <= 0:
+        raise StateError(
+            "portfolio.cash must be positive for cash-only compatibility rebalance; "
+            "initial_capital cannot recreate depleted cash"
+        )
+    catalog = load_bundled_catalog()
+    execution_config = _execution_config(
+        {
+            "commission_rate": commission_rate,
+            "stamp_duty_rate": "0.0005",
+            "instrument_rule_profile": INSTRUMENT_RULE_PROFILE_VERSION,
+            "stale_exit_price_policy": "last_known_signal_close",
+        },
+        catalog,
     )
-    return RebalanceResult(portfolio=new_portfolio, trades=trades)
+    log = new_log(initial_cash=initial, execution_config=execution_config)
+    step = _step_record(
+        signals,
+        source={
+            "kind": "python_api",
+            "path": "in_memory",
+            "sha256": sha256_payload(signals.to_dict()),
+            "market_data_semantics": "paper_research_close_not_live",
+        },
+        catalog=catalog,
+        execution_config=execution_config,
+    )
+    log["steps"].append(step)
+    log = seal_log(log)
+    compiled = _compile(log, catalog)
+    result_portfolio = _portfolio_from(compiled, log, step["as_of"])
+    return RebalanceResult(portfolio=result_portfolio, trades=_latest_trades(compiled))
 
 
-def run_step(config_path: Path) -> RebalanceResult:
-    from quant_paper_sim.readers.signals import load_config, load_signals
+def load_portfolio(path: Path, initial_capital: float) -> PortfolioState:
+    """Read a legacy projection only; never used to restore authoritative execution state."""
 
-    cfg = load_config(config_path)
-    repo_root = config_path.parent.parent
-    state_dir = Path(cfg.get("state_dir", "state"))
-    if not state_dir.is_absolute():
-        state_dir = repo_root / state_dir
+    if not path.is_file():
+        return PortfolioState(as_of="", cash=initial_capital, initial_capital=initial_capital)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    holdings = [
+        Holding(
+            symbol=str(row["symbol"]),
+            shares=int(row["shares"]),
+            price=float(row["price"]),
+        )
+        for row in data.get("holdings") or []
+    ]
+    return PortfolioState(
+        as_of=str(data.get("as_of", "")),
+        cash=float(data.get("cash", initial_capital)),
+        holdings=holdings,
+        initial_capital=float(data.get("initial_capital", initial_capital)),
+        authoritative=False,
+        execution_log_sha256="",
+    )
 
-    initial_capital = float(cfg.get("initial_capital", 100_000))
-    portfolio_path = state_dir / "portfolio.json"
-    nav_path = state_dir / "nav.csv"
-    holdings_path = state_dir / "holdings.csv"
 
-    portfolio = load_portfolio(portfolio_path, initial_capital)
-    if portfolio.initial_capital <= 0:
-        portfolio.initial_capital = initial_capital
-    if portfolio.cash <= 0 and not portfolio.holdings:
-        portfolio.cash = initial_capital
+def save_portfolio(path: Path, portfolio: PortfolioState) -> None:
+    """Compatibility projection writer; authoritative CLI state uses `_commit`."""
 
-    signals = load_signals(cfg, config_path)
-    commission = float(cfg.get("commission_rate", 0.0003))
-    result = rebalance(portfolio, signals, commission_rate=commission)
+    atomic_write_json(path, portfolio.to_dict())
 
-    save_portfolio(portfolio_path, result.portfolio)
-    append_nav(nav_path, result.portfolio)
-    write_holdings_csv(holdings_path, result.portfolio)
 
-    trades_path = state_dir / "trades.json"
-    trades_path.write_text(json.dumps(result.trades, indent=2), encoding="utf-8")
-    return result
+def append_nav(nav_path: Path, portfolio: PortfolioState) -> None:
+    rows: list[dict[str, object]] = []
+    if nav_path.is_file():
+        with nav_path.open(encoding="utf-8", newline="") as handle:
+            rows.extend(csv.DictReader(handle))
+    rows.append({"date": portfolio.as_of, "nav": portfolio.nav, "cash": portfolio.cash})
+    atomic_write_bytes(nav_path, _csv_bytes(["date", "nav", "cash"], rows))
+
+
+def write_holdings_csv(path: Path, portfolio: PortfolioState) -> None:
+    rows = [
+        {
+            "symbol": holding.symbol,
+            "shares": holding.shares,
+            "price": holding.price,
+            "market_value": holding.market_value,
+            "weight": holding.market_value / portfolio.nav if portfolio.nav > 0 else 0,
+        }
+        for holding in portfolio.holdings
+    ]
+    atomic_write_bytes(
+        path,
+        _csv_bytes(["symbol", "shares", "price", "market_value", "weight"], rows),
+    )
