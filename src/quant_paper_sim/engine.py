@@ -14,15 +14,17 @@ from typing import Any
 from quant_execution import execution_payload
 
 from quant_paper_sim.execution import (
+    INSTRUMENT_PROFILE_VERSION,
     MONEY_SCALE,
     CompiledReplay,
     artifact_payloads,
+    certified_instrument_profile,
     compile_log,
     decimal_value,
     fixed,
-    lot_size,
     normalize_symbol,
     parse_as_of,
+    validated_fee_rate,
 )
 from quant_paper_sim.models import Holding, PortfolioState, RebalanceResult, SignalBundle
 from quant_paper_sim.state import (
@@ -40,6 +42,20 @@ from quant_paper_sim.state import (
     validate_log,
 )
 
+_PROJECTION_FILES = (
+    "execution_artifacts.json",
+    "holdings.csv",
+    "nav.csv",
+    "portfolio.json",
+    "trades.json",
+)
+_V2_PORTFOLIO_MARKERS = {
+    "authoritative",
+    "execution_log_sha256",
+    "_execution",
+    "authoritative_sha256",
+}
+
 
 def _state_paths(config_path: Path, cfg: dict[str, Any]) -> StatePaths:
     repo_root = config_path.resolve().parent.parent
@@ -49,18 +65,22 @@ def _state_paths(config_path: Path, cfg: dict[str, Any]) -> StatePaths:
     return StatePaths(state_dir.resolve())
 
 
-def _decimal_config(cfg: dict[str, Any], key: str, default: str) -> str:
-    return format(decimal_value(cfg.get(key, default), key), "f")
-
-
 def _execution_config(cfg: dict[str, Any]) -> dict[str, object]:
     policy = str(cfg.get("stale_exit_price_policy", "last_known_signal_close"))
     if policy != "last_known_signal_close":
         raise StateError("stale_exit_price_policy must be 'last_known_signal_close'")
+    profile = str(cfg.get("instrument_profile", INSTRUMENT_PROFILE_VERSION))
+    if profile != INSTRUMENT_PROFILE_VERSION:
+        raise StateError(f"instrument_profile must be {INSTRUMENT_PROFILE_VERSION!r}")
     return {
-        "commission_rate": _decimal_config(cfg, "commission_rate", "0.0003"),
-        "stamp_duty_rate": _decimal_config(cfg, "stamp_duty_rate", "0.0005"),
-        "price_scale": 2,
+        "commission_rate": validated_fee_rate(
+            cfg.get("commission_rate", "0.0003"), "commission_rate"
+        ),
+        "stamp_duty_rate": validated_fee_rate(
+            cfg.get("stamp_duty_rate", "0.0005"), "stamp_duty_rate"
+        ),
+        "instrument_profile": profile,
+        "price_precision": "per_instrument_spec",
         "money_scale": MONEY_SCALE,
         "bar_participation_rate": "1",
         "slippage_ticks": 0,
@@ -100,11 +120,12 @@ def _step_record(signals: SignalBundle, *, source: dict[str, str]) -> dict[str, 
     targets: list[dict[str, Any]] = []
     seen: set[str] = set()
     for target in signals.targets:
-        code, venue, instrument_id = normalize_symbol(target.symbol)
+        code, profile = certified_instrument_profile(target.symbol)
+        _, venue, instrument_id = normalize_symbol(target.symbol)
         if instrument_id in seen:
             raise StateError(f"duplicate target instrument: {instrument_id}")
         seen.add(instrument_id)
-        price_fixed = fixed(target.price, 2, f"target[{target.symbol}].price")
+        price_fixed = fixed(target.price, profile.price_scale, f"target[{target.symbol}].price")
         price = price_fixed.to_decimal()
         weight = decimal_value(target.weight, f"target[{target.symbol}].weight")
         if weight < 0:
@@ -117,7 +138,9 @@ def _step_record(signals: SignalBundle, *, source: dict[str, str]) -> dict[str, 
                 "weight": format(weight, "f"),
                 "price": format(price, "f"),
                 "price_fixed": {"units": price_fixed.units, "scale": price_fixed.scale},
-                "lot_size": lot_size(target.symbol),
+                "price_scale": profile.price_scale,
+                "profile_id": profile.profile_id,
+                "lot_size": profile.lot,
             }
         )
     if not targets:
@@ -314,25 +337,83 @@ def _commit(
     paths.pending.unlink(missing_ok=True)
 
 
-def _legacy_cash_only_log(
-    paths: StatePaths, cfg: dict[str, Any], *, initial_capital: float
-) -> dict[str, Any]:
-    if not paths.portfolio.is_file():
-        raise StateError(
-            "authoritative execution log is missing; run quant-paper init --config <path>"
-        )
+def _validate_pending_marker(paths: StatePaths) -> dict[str, Any] | None:
+    if not paths.pending.exists():
+        return None
+    if not paths.pending.is_file():
+        raise StateError(f"damaged pending commit marker {PENDING_FILE}: not a regular file")
+    try:
+        pending = json.loads(paths.pending.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise StateError(f"damaged pending commit marker {PENDING_FILE}: {exc}") from exc
+    expected_keys = {"schema", "target_authoritative_sha256", "files"}
+    target = pending.get("target_authoritative_sha256") if isinstance(pending, dict) else None
+    valid_hash = (
+        isinstance(target, str)
+        and len(target) == 64
+        and all(character in "0123456789abcdef" for character in target)
+    )
+    if (
+        not isinstance(pending, dict)
+        or set(pending) != expected_keys
+        or pending.get("schema") != "quant-paper-commit/1.0.0"
+        or pending.get("files") != list(_PROJECTION_FILES)
+        or not valid_hash
+    ):
+        raise StateError("damaged pending commit marker")
+    return pending
+
+
+def _read_legacy_portfolio(paths: StatePaths) -> dict[str, Any]:
     try:
         legacy = json.loads(paths.portfolio.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise StateError(f"legacy portfolio cannot be read for migration: {exc}") from exc
+    if not isinstance(legacy, dict):
+        raise StateError("legacy portfolio must be a JSON object")
+    return legacy
+
+
+def _assert_no_v2_residue_without_log(paths: StatePaths, pending: dict[str, Any] | None) -> None:
+    residue: list[str] = []
+    if pending is not None:
+        residue.append(PENDING_FILE)
+    if paths.projection_manifest.exists():
+        residue.append(paths.projection_manifest.name)
+    if paths.execution_artifacts.exists():
+        residue.append(paths.execution_artifacts.name)
+    if paths.portfolio.is_file():
+        portfolio = _read_legacy_portfolio(paths)
+        markers = sorted(_V2_PORTFOLIO_MARKERS & portfolio.keys())
+        if markers:
+            residue.append(f"portfolio.json markers={markers}")
+    if residue:
+        raise StateError(
+            "authoritative execution log is missing while v2 state residue exists "
+            f"({', '.join(residue)}); do not trust projections or recreate the log—"
+            "restore execution_log.json from backup or archive the state directory and run init"
+        )
+
+
+def _legacy_cash_only_log(paths: StatePaths, cfg: dict[str, Any]) -> dict[str, Any]:
+    if not paths.portfolio.is_file():
+        raise StateError(
+            "authoritative execution log is missing; run quant-paper init --config <path>"
+        )
+    legacy = _read_legacy_portfolio(paths)
     holdings = legacy.get("holdings") or []
     if any(int(row.get("shares", 0)) != 0 for row in holdings):
         raise StateError(
             "legacy portfolio contains holdings and cannot be migrated losslessly; "
             "archive the state directory, then run quant-paper init"
         )
+    if "cash" not in legacy:
+        raise StateError(
+            "legacy cash-only portfolio has no explicit cash; archive the state directory, "
+            "then run quant-paper init"
+        )
     return new_log(
-        initial_cash=legacy.get("cash", initial_capital),
+        initial_cash=legacy["cash"],
         execution_config=_execution_config(cfg),
         migration={
             "kind": "legacy_cash_only",
@@ -349,24 +430,21 @@ def _load_or_migrate(
     initial_capital: float,
     allow_fresh_step_bootstrap: bool = False,
 ) -> dict[str, Any]:
-    if paths.pending.is_file():
-        try:
-            pending = json.loads(paths.pending.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            raise StateError(f"damaged pending commit marker {PENDING_FILE}: {exc}") from exc
-        if not isinstance(pending, dict) or pending.get("schema") != "quant-paper-commit/1.0.0":
-            raise StateError("damaged pending commit marker")
+    pending = _validate_pending_marker(paths)
+    if paths.log.exists() and not paths.log.is_file():
+        raise StateError("authoritative execution log path is not a regular file")
     if paths.log.is_file():
         log = load_log(paths.log)
         _assert_config_compatible(log, cfg)
         return log
+    _assert_no_v2_residue_without_log(paths, pending)
     if allow_fresh_step_bootstrap and not paths.portfolio.is_file():
         return new_log(
             initial_cash=initial_capital,
             execution_config=_execution_config(cfg),
             migration={"kind": "fresh_step_bootstrap", "source": "quant-paper step"},
         )
-    return _legacy_cash_only_log(paths, cfg, initial_capital=initial_capital)
+    return _legacy_cash_only_log(paths, cfg)
 
 
 def initialize(config_path: Path) -> RebalanceResult:
@@ -459,13 +537,19 @@ def rebalance(
             "rebalance compatibility input with holdings cannot be migrated losslessly; "
             "use run_step with an authoritative execution log"
         )
-    initial = portfolio.cash or portfolio.initial_capital
+    initial = decimal_value(portfolio.cash, "portfolio.cash")
+    if initial <= 0:
+        raise StateError(
+            "portfolio.cash must be positive for cash-only compatibility rebalance; "
+            "initial_capital cannot recreate depleted cash"
+        )
     log = new_log(
         initial_cash=initial,
         execution_config={
-            "commission_rate": format(Decimal(str(commission_rate)), "f"),
-            "stamp_duty_rate": "0.0005",
-            "price_scale": 2,
+            "commission_rate": validated_fee_rate(commission_rate, "commission_rate"),
+            "stamp_duty_rate": validated_fee_rate("0.0005", "stamp_duty_rate"),
+            "instrument_profile": INSTRUMENT_PROFILE_VERSION,
+            "price_precision": "per_instrument_spec",
             "money_scale": MONEY_SCALE,
             "bar_participation_rate": "1",
             "slippage_ticks": 0,

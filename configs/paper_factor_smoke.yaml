@@ -4,6 +4,7 @@ cash_reserve: 0.05
 commission_rate: 0.0003
 stamp_duty_rate: 0.0005
 stale_exit_price_policy: last_known_signal_close
+instrument_profile: cn-a-equity-core-etf-2026-08
 
 signals:
   source: csv
