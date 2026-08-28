@@ -61,6 +61,7 @@ provenance explicitly.
 
 - schema and exact `quant-execution` version;
 - initial CNY cash and immutable execution configuration;
+- the fixture catalog logical ID, version, normalized content SHA-256 and validity semantics;
 - normalized signal inputs, source file hashes and research-data semantics;
 - deterministic event/fill evidence and cumulative order/fill/ledger/result hashes;
 - a checksum over the complete journal.
@@ -109,19 +110,34 @@ duplicate instruments fail closed.
 
 ## Certified scope and limits
 
-- Profile `cn-a-equity-core-etf-2026-08` certifies only the following conservative code ranges:
-  SSE main A shares `600000-601999`, `603000-603999`, `605000-605999`; SSE STAR A shares
-  `688000-689999`; SZSE main A shares `000001-003999`; SZSE ChiNext A shares
-  `300000-301999`; SSE core ETF range `510000-518999`; and SZSE ETF ranges
-  `158000-159999`.
-- BSE, B shares, indices, convertible bonds, repos, LOFs, closed-end funds, REITs, warrants, and
-  every code outside those profiles fail closed. This is an intentional certification boundary,
-  not a claim that unsupported exchange products do not exist.
+- `instrument_rule_profile: cn-exchange-product-rules-2026-08` only classifies exchange product
+  rules. A matching code range never proves that a symbol exists, is listed, or is tradable.
+- Execution identity comes from the explicitly configured, versioned PIT catalog
+  `cn-a-core-paper-fixture@1.0.0`. Its fixture-certified rows are exactly `600519`, `000858`,
+  `601318`, `000001`, `000002`, `600000`, `688001`, `510300` and `159919`; any unlisted symbol
+  fails closed even if its code matches a rule range. For example, `159900`, `000300` and
+  `600518` are rejected.
+- The snapshot's `effective_from=2025-01-01T00:00:00Z` means "this fixture certification is
+  applicable from this time." It is deliberately not an exchange listing date and does not
+  describe the historical listing status of `688001`, either ETF, or any other row.
+- The catalog is a deterministic research fixture, not a complete A-share security master,
+  listing-history source, legal-data entitlement, or market-data-certified dataset. M4 must
+  replace it with an authorized, versioned `quant-data-kit` PIT instrument directory before
+  broader symbols or real historical identity claims can be certified.
+- At each signal time, both the business-effective interval and knowledge interval
+  (`available_at`/`superseded_at`) must select exactly one row. The catalog's canonical content
+  hash is pinned in configuration and the authoritative log; a missing, ambiguous, modified,
+  future, expired or superseded row fails closed. Catalog file paths are local lookup details and
+  are not part of the stable execution hash.
+- BSE, B shares, indices, convertible bonds, repos, LOFs, closed-end funds, REITs and warrants
+  remain out of scope. A code-range rule is only a metadata consistency check after catalog
+  resolution, not an allowlist by itself.
 - A-share/ETF paper execution only; CNY base and settlement currency.
 - Stable IDs use `CN.XSHG.<code>` or `CN.XSHE.<code>` instead of provider symbols.
 - Board lots are 200 for `688`/`689` symbols and 100 otherwise.
 - A-share prices use tick `CNY0.01`/scale 2. ETF prices use tick `CNY0.001`/scale 3; target,
   research Bar and limit-order precision all come from the same `InstrumentSpec`.
+- Stocks use `product_type=cn_a_share_paper`; ETFs use `product_type=cn_etf_paper`.
 - Commission and sell-side stock stamp duty are explicit configuration values; ETF stamp duty
   is zero. Both configured rates must be finite and in `[0, 0.1]`. The current generic ETF paper
   rule remains conservatively T+1.
@@ -133,7 +149,7 @@ The tick rules are grounded in the official
 [SSE Trading Rules (2026), section 3.3.11](https://www.sse.com.cn/lawandrules/sselawsrules2025/stocks/exchange/c/c_20260424_10816482.shtml),
 [SSE ETF FAQ](https://www.sse.com.cn/assortment/fund/etf/question/c/c_20240118_5734754.shtml),
 and [SZSE price-unit guidance](https://www.szse.cn/www/investor/index/update/t20200408_575791.html).
-The SZSE ETF ranges follow the official
+The classification-only SZSE ETF ranges follow the official
 [code-range table](https://www.szse.cn/marketServices/technicalservice/doc/P020240510623040090566.pdf)
 and [158-range expansion notice](https://www.szse.cn/marketServices/technicalservice/notice/t20230825_602945.html).
 

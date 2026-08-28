@@ -12,8 +12,15 @@ Thin paper-trading CLI over the exact `quant-execution` v0.2.0 dependency.
 - Preserve `quant-paper init|step|status --config ...` and `configs/pipeline.yaml` path behavior.
 - Generated signal-close bars must remain explicitly marked research-only and not-live.
 - Sell fills must settle into the ledger before buy intents are risk-checked.
-- Instrument identity, board lot and price precision must come from the versioned certified
-  profile; stocks use scale 2 and certified ETFs use scale 3.
+- Code-range rule profiles classify product rules only and must never establish instrument
+  identity or tradability.
+- Instrument identity must resolve uniquely through the configured versioned PIT catalog before
+  rule metadata is checked. Catalog identity and canonical content hash belong in the
+  authoritative execution configuration; local filesystem paths do not.
+- The bundled catalog is fixture-certified only. Its 2025-01-01 effective boundary is fixture
+  applicability, not listing history; never describe it as full-market or market-data-certified.
+- Board lot and price precision must come from the resolved `InstrumentSpec`; stocks use scale 2
+  and certified ETFs use scale 3.
 - Commission and stamp-duty rates must remain finite, non-negative and capped before replay.
 - CSV `top_n`, factors, prices and explicit weights must be validated without fallback weighting.
 - Do not add broker credentials, live adapters or order-transmission code.

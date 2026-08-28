@@ -2,17 +2,16 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import ROUND_FLOOR, Decimal, InvalidOperation
 from typing import Any
 
 from quant_data_kit import (
-    AssetClass,
     BarEvent,
     FixedPoint,
     InstrumentSpec,
-    MarginMode,
+    dataclass_payload,
     market_event_payload,
 )
 from quant_data_kit.exceptions import ValidationError
@@ -29,7 +28,16 @@ from quant_execution import (
     execution_payload,
 )
 
-from quant_paper_sim.state import StateError
+from quant_paper_sim.instrument_catalog import (
+    DEFAULT_FIXTURE_QUERY_TIME,
+    INSTRUMENT_RULE_PROFILE_VERSION,
+    CatalogRecord,
+    InstrumentCatalog,
+    InstrumentRuleProfile,
+    classify_symbol_rule,
+    load_bundled_catalog,
+)
+from quant_paper_sim.state import StateError, sha256_payload
 
 UTC = timezone.utc
 MONEY_SCALE = 8
@@ -37,93 +45,7 @@ ACCOUNT_ID = "paper-account"
 STRATEGY_ID = "paper-rebalance-v2"
 RUN_ID = "quant-paper-v2"
 SEED = 42
-INSTRUMENT_PROFILE_VERSION = "cn-a-equity-core-etf-2026-08"
 MAX_PAPER_FEE_RATE = Decimal("0.1")
-_INSTRUMENT_AVAILABLE_AT = datetime(2000, 1, 1, tzinfo=UTC)
-
-
-@dataclass(frozen=True)
-class CertifiedInstrumentProfile:
-    """Conservative, auditable subset certified by this paper adapter."""
-
-    profile_id: str
-    venue: str
-    code_ranges: tuple[tuple[int, int], ...]
-    asset_class: AssetClass
-    price_scale: int
-    price_tick: str
-    lot: int
-    stamp_duty: bool
-
-    def accepts(self, code: str) -> bool:
-        value = int(code)
-        return any(lower <= value <= upper for lower, upper in self.code_ranges)
-
-
-# These deliberately conservative ranges are product profiles, not a general symbol guesser.
-# Out-of-scope exchange products are rejected even when their first digit resembles a profile.
-CERTIFIED_INSTRUMENT_PROFILES = (
-    CertifiedInstrumentProfile(
-        profile_id="sse-main-a-v1",
-        venue="XSHG",
-        code_ranges=((600000, 601999), (603000, 603999), (605000, 605999)),
-        asset_class=AssetClass.EQUITY,
-        price_scale=2,
-        price_tick="0.01",
-        lot=100,
-        stamp_duty=True,
-    ),
-    CertifiedInstrumentProfile(
-        profile_id="sse-star-a-v1",
-        venue="XSHG",
-        code_ranges=((688000, 689999),),
-        asset_class=AssetClass.EQUITY,
-        price_scale=2,
-        price_tick="0.01",
-        lot=200,
-        stamp_duty=True,
-    ),
-    CertifiedInstrumentProfile(
-        profile_id="szse-main-a-v1",
-        venue="XSHE",
-        code_ranges=((1, 3999),),
-        asset_class=AssetClass.EQUITY,
-        price_scale=2,
-        price_tick="0.01",
-        lot=100,
-        stamp_duty=True,
-    ),
-    CertifiedInstrumentProfile(
-        profile_id="szse-chinext-a-v1",
-        venue="XSHE",
-        code_ranges=((300000, 301999),),
-        asset_class=AssetClass.EQUITY,
-        price_scale=2,
-        price_tick="0.01",
-        lot=100,
-        stamp_duty=True,
-    ),
-    CertifiedInstrumentProfile(
-        profile_id="sse-core-etf-v1",
-        venue="XSHG",
-        code_ranges=((510000, 518999),),
-        asset_class=AssetClass.ETF,
-        price_scale=3,
-        price_tick="0.001",
-        lot=100,
-        stamp_duty=False,
-    ),
-    CertifiedInstrumentProfile(
-        profile_id="szse-core-etf-v1",
-        venue="XSHE",
-        code_ranges=((158000, 159999),),
-        asset_class=AssetClass.ETF,
-        price_scale=3,
-        price_tick="0.001",
-        lot=100,
-        stamp_duty=False,
-    ),
-)
 
 
 def decimal_value(value: object, field: str) -> Decimal:
@@ -167,42 +89,71 @@ def parse_as_of(value: str) -> tuple[datetime, date]:
     return normalized, normalized.date()
 
 
-def certified_instrument_profile(symbol: str) -> tuple[str, CertifiedInstrumentProfile]:
-    raw = str(symbol).strip().upper()
-    if not raw:
-        raise StateError("symbol is required")
-    parts = raw.split(".")
-    code = parts[0]
-    if not code.isdigit() or len(code) != 6:
-        raise StateError(f"unsupported A-share symbol: {symbol!r}")
-    suffix = parts[1] if len(parts) == 2 else ""
-    if len(parts) > 2:
-        raise StateError(f"unsupported A-share symbol: {symbol!r}")
-    suffix_venues = {"SH": "XSHG", "SS": "XSHG", "XSHG": "XSHG", "SZ": "XSHE", "XSHE": "XSHE"}
-    if suffix and suffix not in suffix_venues:
-        raise StateError(f"unsupported A-share venue suffix: {suffix!r}")
-    venue = suffix_venues.get(suffix)
-    matches = [
-        profile
-        for profile in CERTIFIED_INSTRUMENT_PROFILES
-        if (venue is None or profile.venue == venue) and profile.accepts(code)
-    ]
-    if len(matches) != 1:
-        raise StateError(
-            f"symbol is outside certified profile {INSTRUMENT_PROFILE_VERSION}: {symbol!r}"
-        )
-    return code, matches[0]
+def _resolve_catalog_record(
+    symbol: str,
+    *,
+    catalog: InstrumentCatalog | None = None,
+    observation_time: datetime = DEFAULT_FIXTURE_QUERY_TIME,
+    as_of_time: datetime = DEFAULT_FIXTURE_QUERY_TIME,
+) -> CatalogRecord:
+    active_catalog = catalog if catalog is not None else load_bundled_catalog()
+    return active_catalog.resolve(
+        symbol,
+        observation_time=observation_time,
+        as_of_time=as_of_time,
+    )
 
 
-def normalize_symbol(symbol: str) -> tuple[str, str, str]:
-    code, profile = certified_instrument_profile(symbol)
-    venue = profile.venue
-    return code, venue, f"CN.{venue}.{code}"
+def certified_instrument_profile(
+    symbol: str,
+    *,
+    catalog: InstrumentCatalog | None = None,
+    observation_time: datetime = DEFAULT_FIXTURE_QUERY_TIME,
+    as_of_time: datetime = DEFAULT_FIXTURE_QUERY_TIME,
+) -> tuple[str, InstrumentRuleProfile]:
+    """Return the rule profile only after the PIT catalog certifies identity."""
+
+    record = _resolve_catalog_record(
+        symbol,
+        catalog=catalog,
+        observation_time=observation_time,
+        as_of_time=as_of_time,
+    )
+    code = record.mapping.provider_symbol
+    _, profile = classify_symbol_rule(symbol)
+    return code, profile
 
 
-def lot_size(symbol: str) -> int:
-    _, profile = certified_instrument_profile(symbol)
-    return profile.lot
+def normalize_symbol(
+    symbol: str,
+    *,
+    catalog: InstrumentCatalog | None = None,
+    observation_time: datetime = DEFAULT_FIXTURE_QUERY_TIME,
+    as_of_time: datetime = DEFAULT_FIXTURE_QUERY_TIME,
+) -> tuple[str, str, str]:
+    record = _resolve_catalog_record(
+        symbol,
+        catalog=catalog,
+        observation_time=observation_time,
+        as_of_time=as_of_time,
+    )
+    return record.mapping.provider_symbol, record.instrument.venue, record.instrument.instrument_id
+
+
+def lot_size(
+    symbol: str,
+    *,
+    catalog: InstrumentCatalog | None = None,
+    observation_time: datetime = DEFAULT_FIXTURE_QUERY_TIME,
+    as_of_time: datetime = DEFAULT_FIXTURE_QUERY_TIME,
+) -> int:
+    record = _resolve_catalog_record(
+        symbol,
+        catalog=catalog,
+        observation_time=observation_time,
+        as_of_time=as_of_time,
+    )
+    return int(record.instrument.quantity_step.to_decimal())
 
 
 def instrument_spec(
@@ -210,31 +161,25 @@ def instrument_spec(
     *,
     commission_rate: str,
     stamp_duty_rate: str,
+    catalog: InstrumentCatalog | None = None,
+    observation_time: datetime = DEFAULT_FIXTURE_QUERY_TIME,
+    as_of_time: datetime = DEFAULT_FIXTURE_QUERY_TIME,
 ) -> InstrumentSpec:
     commission_rate = validated_fee_rate(commission_rate, "commission_rate")
     stamp_duty_rate = validated_fee_rate(stamp_duty_rate, "stamp_duty_rate")
-    code, profile = certified_instrument_profile(symbol)
-    venue = profile.venue
-    instrument_id = f"CN.{venue}.{code}"
-    return InstrumentSpec(
-        instrument_id=instrument_id,
-        asset_class=profile.asset_class,
-        product_type="cn_a_share_paper",
-        venue=venue,
-        native_symbol=f"{code}.{venue}",
-        base_currency=None,
-        quote_currency="CNY",
-        settlement_currency="CNY",
-        price_tick=fixed(profile.price_tick, profile.price_scale, "price_tick"),
-        quantity_step=fixed(profile.lot, 0, "quantity_step"),
-        contract_multiplier=fixed(1, 0, "contract_multiplier"),
-        calendar_id="CN-A-SHARE",
-        margin_mode=MarginMode.NONE,
-        effective_from=_INSTRUMENT_AVAILABLE_AT,
-        available_at=_INSTRUMENT_AVAILABLE_AT,
+    record = _resolve_catalog_record(
+        symbol,
+        catalog=catalog,
+        observation_time=observation_time,
+        as_of_time=as_of_time,
+    )
+    _, profile = classify_symbol_rule(symbol)
+    return replace(
+        record.instrument,
         metadata={
-            "instrument_profile": INSTRUMENT_PROFILE_VERSION,
-            "profile_id": profile.profile_id,
+            **record.instrument.metadata,
+            "instrument_rule_profile": INSTRUMENT_RULE_PROFILE_VERSION,
+            "rule_profile_id": profile.profile_id,
             "price_scale": str(profile.price_scale),
             "lot_size": str(profile.lot),
             "commission_rate": commission_rate,
@@ -397,25 +342,42 @@ def _desired_quantities(step: dict[str, Any], nav: Decimal) -> dict[str, int]:
     return desired
 
 
-def compile_log(log: dict[str, Any]) -> CompiledReplay:
+def compile_log(
+    log: dict[str, Any],
+    *,
+    catalog: InstrumentCatalog | None = None,
+) -> CompiledReplay:
     config = log["execution_config"]
-    if config.get("instrument_profile") != INSTRUMENT_PROFILE_VERSION:
-        raise StateError("authoritative log uses an unsupported instrument profile")
+    active_catalog = catalog if catalog is not None else load_bundled_catalog()
+    if config.get("instrument_rule_profile") != INSTRUMENT_RULE_PROFILE_VERSION:
+        raise StateError("authoritative log uses an unsupported instrument rule profile")
+    if config.get("instrument_catalog") != active_catalog.execution_identity:
+        raise StateError("authoritative log instrument catalog identity or hash differs")
     commission = validated_fee_rate(config["commission_rate"], "commission_rate")
     stamp = validated_fee_rate(config["stamp_duty_rate"], "stamp_duty_rate")
     registry: dict[str, InstrumentSpec] = {}
     instrument_symbols: dict[str, str] = {}
     for step in log["steps"]:
+        step_time, _ = parse_as_of(step["as_of"])
         for row in step["targets"]:
-            spec = instrument_spec(row["symbol"], commission_rate=commission, stamp_duty_rate=stamp)
+            spec = instrument_spec(
+                row["symbol"],
+                commission_rate=commission,
+                stamp_duty_rate=stamp,
+                catalog=active_catalog,
+                observation_time=step_time,
+                as_of_time=step_time,
+            )
             expected_scale = int(spec.metadata["price_scale"])
             expected_fixed = fixed(row["price"], expected_scale, "target.price")
             persisted_fixed = row.get("price_fixed")
+            expected_spec_sha256 = sha256_payload(dataclass_payload(spec))
             mapping_matches = (
                 spec.instrument_id == row.get("instrument_id")
                 and spec.native_symbol == row.get("native_symbol")
                 and int(row.get("lot_size", -1)) == int(spec.metadata["lot_size"])
-                and row.get("profile_id") == spec.metadata["profile_id"]
+                and row.get("rule_profile_id") == spec.metadata["rule_profile_id"]
+                and row.get("instrument_spec_sha256") == expected_spec_sha256
                 and int(row.get("price_scale", -1)) == expected_scale
                 and isinstance(persisted_fixed, dict)
                 and persisted_fixed.get("units") == expected_fixed.units
@@ -423,7 +385,7 @@ def compile_log(log: dict[str, Any]) -> CompiledReplay:
             )
             if not mapping_matches:
                 raise StateError(
-                    "persisted target instrument mapping does not match certified rules"
+                    "persisted target instrument mapping does not match the PIT catalog"
                 )
             registry[spec.instrument_id] = spec
             instrument_symbols[spec.instrument_id] = row["symbol"]

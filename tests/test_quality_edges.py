@@ -30,6 +30,10 @@ from quant_paper_sim.execution import (
     instrument_spec,
     parse_as_of,
 )
+from quant_paper_sim.instrument_catalog import (
+    INSTRUMENT_RULE_PROFILE_VERSION,
+    bundled_catalog_config,
+)
 from quant_paper_sim.models import Holding, PortfolioState, SignalBundle, TargetPosition
 from quant_paper_sim.readers.signals import (
     load_factor_csv,
@@ -54,6 +58,8 @@ def make_case(tmp_path: Path, *, state_dir: str | None = None) -> tuple[Path, Pa
                 "cash_reserve": 0.05,
                 "commission_rate": 0.0003,
                 "stamp_duty_rate": 0.0005,
+                "instrument_rule_profile": INSTRUMENT_RULE_PROFILE_VERSION,
+                "instrument_catalog": bundled_catalog_config(),
                 "signals": {"source": "yaml", "path": str(signal)},
             }
         ),
@@ -376,7 +382,7 @@ def test_invalid_symbols_fail_closed(symbol: str) -> None:
     ],
 )
 def test_out_of_scope_exchange_products_fail_closed(symbol: str) -> None:
-    with pytest.raises(StateError, match="outside certified profile"):
+    with pytest.raises(StateError, match="outside rule profile|not fixture-certified"):
         paper_engine.normalize_symbol(symbol)
 
 
