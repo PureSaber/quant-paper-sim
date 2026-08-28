@@ -11,20 +11,26 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+from quant_data_kit import dataclass_payload
 from quant_execution import execution_payload
 
 from quant_paper_sim.execution import (
-    INSTRUMENT_PROFILE_VERSION,
     MONEY_SCALE,
     CompiledReplay,
     artifact_payloads,
-    certified_instrument_profile,
     compile_log,
     decimal_value,
     fixed,
-    normalize_symbol,
+    instrument_spec,
     parse_as_of,
     validated_fee_rate,
+)
+from quant_paper_sim.execution import normalize_symbol as _normalize_symbol
+from quant_paper_sim.instrument_catalog import (
+    INSTRUMENT_RULE_PROFILE_VERSION,
+    InstrumentCatalog,
+    load_bundled_catalog,
+    load_configured_catalog,
 )
 from quant_paper_sim.models import Holding, PortfolioState, RebalanceResult, SignalBundle
 from quant_paper_sim.state import (
@@ -65,13 +71,13 @@ def _state_paths(config_path: Path, cfg: dict[str, Any]) -> StatePaths:
     return StatePaths(state_dir.resolve())
 
 
-def _execution_config(cfg: dict[str, Any]) -> dict[str, object]:
+def _execution_config(cfg: dict[str, Any], catalog: InstrumentCatalog) -> dict[str, object]:
     policy = str(cfg.get("stale_exit_price_policy", "last_known_signal_close"))
     if policy != "last_known_signal_close":
         raise StateError("stale_exit_price_policy must be 'last_known_signal_close'")
-    profile = str(cfg.get("instrument_profile", INSTRUMENT_PROFILE_VERSION))
-    if profile != INSTRUMENT_PROFILE_VERSION:
-        raise StateError(f"instrument_profile must be {INSTRUMENT_PROFILE_VERSION!r}")
+    profile = str(cfg.get("instrument_rule_profile", ""))
+    if profile != INSTRUMENT_RULE_PROFILE_VERSION:
+        raise StateError(f"instrument_rule_profile must be {INSTRUMENT_RULE_PROFILE_VERSION!r}")
     return {
         "commission_rate": validated_fee_rate(
             cfg.get("commission_rate", "0.0003"), "commission_rate"
@@ -79,7 +85,8 @@ def _execution_config(cfg: dict[str, Any]) -> dict[str, object]:
         "stamp_duty_rate": validated_fee_rate(
             cfg.get("stamp_duty_rate", "0.0005"), "stamp_duty_rate"
         ),
-        "instrument_profile": profile,
+        "instrument_rule_profile": profile,
+        "instrument_catalog": catalog.execution_identity,
         "price_precision": "per_instrument_spec",
         "money_scale": MONEY_SCALE,
         "bar_participation_rate": "1",
@@ -90,8 +97,10 @@ def _execution_config(cfg: dict[str, Any]) -> dict[str, object]:
     }
 
 
-def _assert_config_compatible(log: dict[str, Any], cfg: dict[str, Any]) -> None:
-    if log["execution_config"] != _execution_config(cfg):
+def _assert_config_compatible(
+    log: dict[str, Any], cfg: dict[str, Any], catalog: InstrumentCatalog
+) -> None:
+    if log["execution_config"] != _execution_config(cfg, catalog):
         raise StateError(
             "execution configuration differs from the authoritative log; "
             "run quant-paper init to start a new state"
@@ -115,17 +124,33 @@ def _source_provenance(cfg: dict[str, Any], config_path: Path) -> dict[str, str]
     }
 
 
-def _step_record(signals: SignalBundle, *, source: dict[str, str]) -> dict[str, Any]:
+def _step_record(
+    signals: SignalBundle,
+    *,
+    source: dict[str, str],
+    catalog: InstrumentCatalog,
+    execution_config: dict[str, object],
+) -> dict[str, Any]:
     at, trading_day = parse_as_of(signals.as_of)
     targets: list[dict[str, Any]] = []
     seen: set[str] = set()
     for target in signals.targets:
-        code, profile = certified_instrument_profile(target.symbol)
-        _, venue, instrument_id = normalize_symbol(target.symbol)
+        spec = instrument_spec(
+            target.symbol,
+            commission_rate=str(execution_config["commission_rate"]),
+            stamp_duty_rate=str(execution_config["stamp_duty_rate"]),
+            catalog=catalog,
+            observation_time=at,
+            as_of_time=at,
+        )
+        code = spec.native_symbol.split(".", 1)[0]
+        venue = spec.venue
+        instrument_id = spec.instrument_id
         if instrument_id in seen:
             raise StateError(f"duplicate target instrument: {instrument_id}")
         seen.add(instrument_id)
-        price_fixed = fixed(target.price, profile.price_scale, f"target[{target.symbol}].price")
+        price_scale = int(spec.metadata["price_scale"])
+        price_fixed = fixed(target.price, price_scale, f"target[{target.symbol}].price")
         price = price_fixed.to_decimal()
         weight = decimal_value(target.weight, f"target[{target.symbol}].weight")
         if weight < 0:
@@ -138,9 +163,10 @@ def _step_record(signals: SignalBundle, *, source: dict[str, str]) -> dict[str, 
                 "weight": format(weight, "f"),
                 "price": format(price, "f"),
                 "price_fixed": {"units": price_fixed.units, "scale": price_fixed.scale},
-                "price_scale": profile.price_scale,
-                "profile_id": profile.profile_id,
-                "lot_size": profile.lot,
+                "price_scale": price_scale,
+                "rule_profile_id": spec.metadata["rule_profile_id"],
+                "lot_size": int(spec.metadata["lot_size"]),
+                "instrument_spec_sha256": sha256_payload(dataclass_payload(spec)),
             }
         )
     if not targets:
@@ -174,9 +200,16 @@ def _validate_replay_evidence(log: dict[str, Any], compiled: CompiledReplay) -> 
             raise StateError("replayed order/fill/ledger hashes differ from authoritative evidence")
 
 
-def _compile(log: dict[str, Any]) -> CompiledReplay:
+def normalize_symbol(symbol: str) -> tuple[str, str, str]:
+    """Compatibility export backed by the bundled fixture-certified catalog."""
+
+    return _normalize_symbol(symbol)
+
+
+def _compile(log: dict[str, Any], catalog: InstrumentCatalog | None = None) -> CompiledReplay:
+    active_catalog = catalog if catalog is not None else load_bundled_catalog()
     validated = validate_log(log)
-    compiled = compile_log(validated)
+    compiled = compile_log(validated, catalog=active_catalog)
     _validate_replay_evidence(validated, compiled)
     if (
         compiled.runtime.engine.sends_live_orders
@@ -395,7 +428,9 @@ def _assert_no_v2_residue_without_log(paths: StatePaths, pending: dict[str, Any]
         )
 
 
-def _legacy_cash_only_log(paths: StatePaths, cfg: dict[str, Any]) -> dict[str, Any]:
+def _legacy_cash_only_log(
+    paths: StatePaths, cfg: dict[str, Any], catalog: InstrumentCatalog
+) -> dict[str, Any]:
     if not paths.portfolio.is_file():
         raise StateError(
             "authoritative execution log is missing; run quant-paper init --config <path>"
@@ -414,7 +449,7 @@ def _legacy_cash_only_log(paths: StatePaths, cfg: dict[str, Any]) -> dict[str, A
         )
     return new_log(
         initial_cash=legacy["cash"],
-        execution_config=_execution_config(cfg),
+        execution_config=_execution_config(cfg, catalog),
         migration={
             "kind": "legacy_cash_only",
             "source": "portfolio.json",
@@ -426,6 +461,7 @@ def _legacy_cash_only_log(paths: StatePaths, cfg: dict[str, Any]) -> dict[str, A
 def _load_or_migrate(
     paths: StatePaths,
     cfg: dict[str, Any],
+    catalog: InstrumentCatalog,
     *,
     initial_capital: float,
     allow_fresh_step_bootstrap: bool = False,
@@ -435,26 +471,30 @@ def _load_or_migrate(
         raise StateError("authoritative execution log path is not a regular file")
     if paths.log.is_file():
         log = load_log(paths.log)
-        _assert_config_compatible(log, cfg)
+        _assert_config_compatible(log, cfg, catalog)
         return log
     _assert_no_v2_residue_without_log(paths, pending)
     if allow_fresh_step_bootstrap and not paths.portfolio.is_file():
         return new_log(
             initial_cash=initial_capital,
-            execution_config=_execution_config(cfg),
+            execution_config=_execution_config(cfg, catalog),
             migration={"kind": "fresh_step_bootstrap", "source": "quant-paper step"},
         )
-    return _legacy_cash_only_log(paths, cfg)
+    return _legacy_cash_only_log(paths, cfg, catalog)
 
 
 def initialize(config_path: Path) -> RebalanceResult:
     from quant_paper_sim.readers.signals import load_config
 
     cfg = load_config(config_path)
+    catalog = load_configured_catalog(cfg, config_path)
     paths = _state_paths(config_path, cfg)
     initial_capital = float(cfg.get("initial_capital", 100_000))
-    log = new_log(initial_cash=initial_capital, execution_config=_execution_config(cfg))
-    compiled = _compile(log)
+    log = new_log(
+        initial_cash=initial_capital,
+        execution_config=_execution_config(cfg, catalog),
+    )
+    compiled = _compile(log, catalog)
     portfolio = _portfolio_from(compiled, log, "init")
     result = RebalanceResult(portfolio=portfolio, trades=[])
     _commit(paths, log, compiled, portfolio, [])
@@ -465,10 +505,11 @@ def status(config_path: Path) -> PortfolioState:
     from quant_paper_sim.readers.signals import load_config
 
     cfg = load_config(config_path)
+    catalog = load_configured_catalog(cfg, config_path)
     paths = _state_paths(config_path, cfg)
     initial_capital = float(cfg.get("initial_capital", 100_000))
-    log = _load_or_migrate(paths, cfg, initial_capital=initial_capital)
-    compiled = _compile(log)
+    log = _load_or_migrate(paths, cfg, catalog, initial_capital=initial_capital)
+    compiled = _compile(log, catalog)
     as_of = log["steps"][-1]["as_of"] if log["steps"] else "init"
     portfolio = _portfolio_from(compiled, log, as_of)
     trades = _latest_trades(compiled)
@@ -480,23 +521,31 @@ def run_step(config_path: Path) -> RebalanceResult:
     from quant_paper_sim.readers.signals import load_config, load_signals
 
     cfg = load_config(config_path)
+    catalog = load_configured_catalog(cfg, config_path)
+    execution_config = _execution_config(cfg, catalog)
     paths = _state_paths(config_path, cfg)
     initial_capital = float(cfg.get("initial_capital", 100_000))
     log = _load_or_migrate(
         paths,
         cfg,
+        catalog,
         initial_capital=initial_capital,
         allow_fresh_step_bootstrap=True,
     )
     source = _source_provenance(cfg, config_path)
     signals = load_signals(cfg, config_path)
-    step = _step_record(signals, source=source)
+    step = _step_record(
+        signals,
+        source=source,
+        catalog=catalog,
+        execution_config=execution_config,
+    )
 
     matching = [item for item in log["steps"] if item["as_of"] == step["as_of"]]
     if matching:
         if matching[0]["input_sha256"] != step["input_sha256"]:
             raise StateError("conflicting paper step content for the same as_of")
-        compiled = _compile(log)
+        compiled = _compile(log, catalog)
         portfolio = _portfolio_from(compiled, log, step["as_of"])
         trades = _latest_trades(compiled)
         _commit(paths, log, compiled, portfolio, trades)
@@ -507,7 +556,7 @@ def run_step(config_path: Path) -> RebalanceResult:
     candidate = deepcopy(log)
     candidate["steps"].append(step)
     candidate = seal_log(candidate)
-    compiled = compile_log(candidate)
+    compiled = compile_log(candidate, catalog=catalog)
     artifacts = compiled.runtime.engine.artifacts
     if artifacts is None:
         raise StateError("quant-execution did not produce artifacts")
@@ -517,7 +566,7 @@ def run_step(config_path: Path) -> RebalanceResult:
     }
     candidate["steps"][-1]["cumulative_result"] = execution_payload(artifacts.result)
     candidate = seal_log(candidate)
-    compiled = _compile(candidate)
+    compiled = _compile(candidate, catalog)
     portfolio = _portfolio_from(compiled, candidate, step["as_of"])
     trades = _latest_trades(compiled)
     _commit(paths, candidate, compiled, portfolio, trades)
@@ -543,21 +592,17 @@ def rebalance(
             "portfolio.cash must be positive for cash-only compatibility rebalance; "
             "initial_capital cannot recreate depleted cash"
         )
-    log = new_log(
-        initial_cash=initial,
-        execution_config={
-            "commission_rate": validated_fee_rate(commission_rate, "commission_rate"),
-            "stamp_duty_rate": validated_fee_rate("0.0005", "stamp_duty_rate"),
-            "instrument_profile": INSTRUMENT_PROFILE_VERSION,
-            "price_precision": "per_instrument_spec",
-            "money_scale": MONEY_SCALE,
-            "bar_participation_rate": "1",
-            "slippage_ticks": 0,
-            "seed": 42,
-            "market_data_mode": "paper_research_close_not_live",
+    catalog = load_bundled_catalog()
+    execution_config = _execution_config(
+        {
+            "commission_rate": commission_rate,
+            "stamp_duty_rate": "0.0005",
+            "instrument_rule_profile": INSTRUMENT_RULE_PROFILE_VERSION,
             "stale_exit_price_policy": "last_known_signal_close",
         },
+        catalog,
     )
+    log = new_log(initial_cash=initial, execution_config=execution_config)
     step = _step_record(
         signals,
         source={
@@ -566,10 +611,12 @@ def rebalance(
             "sha256": sha256_payload(signals.to_dict()),
             "market_data_semantics": "paper_research_close_not_live",
         },
+        catalog=catalog,
+        execution_config=execution_config,
     )
     log["steps"].append(step)
     log = seal_log(log)
-    compiled = _compile(log)
+    compiled = _compile(log, catalog)
     result_portfolio = _portfolio_from(compiled, log, step["as_of"])
     return RebalanceResult(portfolio=result_portfolio, trades=_latest_trades(compiled))
 

@@ -48,6 +48,13 @@ def test_step_smoke(tmp_path: Path):
 state_dir: {state.as_posix()}
 initial_capital: 100000
 cash_reserve: 0.05
+instrument_rule_profile: cn-exchange-product-rules-2026-08
+instrument_catalog:
+  path: package://quant_paper_sim/data/cn_a_core_fixture_v1.json
+  logical_id: cn-a-core-paper-fixture
+  version: 1.0.0
+  certification_level: fixture-certified
+  content_sha256: d37ed48c446e7d99a37c1989cf7d466ef30ab338c099401b299a237b89dec369
 signals:
   source: yaml
   path: {signals.as_posix()}

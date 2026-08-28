@@ -15,6 +15,10 @@ import yaml
 from quant_paper_sim.cli import main
 from quant_paper_sim.engine import initialize, rebalance, run_step, status
 from quant_paper_sim.execution import compile_log, lot_size, normalize_symbol
+from quant_paper_sim.instrument_catalog import (
+    INSTRUMENT_RULE_PROFILE_VERSION,
+    bundled_catalog_config,
+)
 from quant_paper_sim.models import PortfolioState, SignalBundle, TargetPosition
 from quant_paper_sim.readers.signals import load_config, load_signals
 from quant_paper_sim.state import StateError, load_log
@@ -66,6 +70,8 @@ def paper_config(
                 "commission_rate": float(commission_rate),
                 "stamp_duty_rate": float(stamp_duty_rate),
                 "stale_exit_price_policy": "last_known_signal_close",
+                "instrument_rule_profile": INSTRUMENT_RULE_PROFILE_VERSION,
+                "instrument_catalog": bundled_catalog_config(),
                 "signals": {"source": "yaml", "path": str(signal_path)},
             },
             sort_keys=False,
@@ -327,6 +333,8 @@ def test_factor_csv_is_a_real_supported_source_and_unknown_source_fails(tmp_path
             {
                 "state_dir": str(state_dir),
                 "initial_capital": 100_000,
+                "instrument_rule_profile": INSTRUMENT_RULE_PROFILE_VERSION,
+                "instrument_catalog": bundled_catalog_config(),
                 "signals": {
                     "source": "csv",
                     "path": str(fixture),
