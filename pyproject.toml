@@ -4,25 +4,28 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "quant-paper-sim"
-version = "0.1.0"
-description = "Paper trading simulator: signals to simulated holdings and NAV for the quant stack"
+version = "0.2.0"
+description = "Thin deterministic paper CLI over quant-execution"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.10"
 dependencies = [
-    "pandas>=2.0",
-    "numpy>=1.24",
-    "pyyaml>=6.0",
+    "pandas>=2.0,<3.0",
+    "pyyaml>=6.0,<7.0",
+    "quant-execution @ git+https://github.com/PureSaber/quant-execution.git@v0.2.0",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.4", "ruff>=0.9.0"]
+dev = ["pytest>=8.0,<10.0", "pytest-cov>=5.0,<8.0", "ruff==0.16.5"]
 
 [project.scripts]
 quant-paper = "quant_paper_sim.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+quant_paper_sim = ["data/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -31,3 +34,11 @@ pythonpath = ["src"]
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+
+[tool.coverage.run]
+branch = true
+source = ["quant_paper_sim"]
+
+[tool.coverage.report]
+fail_under = 80
+show_missing = true

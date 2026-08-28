@@ -2,6 +2,16 @@ state_dir: state
 initial_capital: 100000
 cash_reserve: 0.05
 commission_rate: 0.0003
+stamp_duty_rate: 0.0005
+stale_exit_price_policy: last_known_signal_close
+instrument_rule_profile: cn-exchange-product-rules-2026-08
+# Fixture-only PIT identity snapshot; effective_from is fixture applicability, not listing history.
+instrument_catalog:
+  path: package://quant_paper_sim/data/cn_a_core_fixture_v1.json
+  logical_id: cn-a-core-paper-fixture
+  version: 1.0.0
+  certification_level: fixture-certified
+  content_sha256: d37ed48c446e7d99a37c1989cf7d466ef30ab338c099401b299a237b89dec369
 
 signals:
   source: yaml
