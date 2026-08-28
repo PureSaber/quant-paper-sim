@@ -76,6 +76,9 @@ class InstrumentRuleProfile:
     code_ranges: tuple[tuple[int, int], ...]
     asset_class: AssetClass
     product_type: str
+    quote_currency: str
+    settlement_currency: str
+    calendar_id: str
     price_scale: int
     price_tick_units: int
     lot: int
@@ -93,6 +96,9 @@ INSTRUMENT_RULE_PROFILES = (
         code_ranges=((600000, 601999), (603000, 603999), (605000, 605999)),
         asset_class=AssetClass.EQUITY,
         product_type="cn_a_share_paper",
+        quote_currency="CNY",
+        settlement_currency="CNY",
+        calendar_id="CN-A-SHARE",
         price_scale=2,
         price_tick_units=1,
         lot=100,
@@ -104,6 +110,9 @@ INSTRUMENT_RULE_PROFILES = (
         code_ranges=((688000, 689999),),
         asset_class=AssetClass.EQUITY,
         product_type="cn_a_share_paper",
+        quote_currency="CNY",
+        settlement_currency="CNY",
+        calendar_id="CN-A-SHARE",
         price_scale=2,
         price_tick_units=1,
         lot=200,
@@ -115,6 +124,9 @@ INSTRUMENT_RULE_PROFILES = (
         code_ranges=((1, 3999),),
         asset_class=AssetClass.EQUITY,
         product_type="cn_a_share_paper",
+        quote_currency="CNY",
+        settlement_currency="CNY",
+        calendar_id="CN-A-SHARE",
         price_scale=2,
         price_tick_units=1,
         lot=100,
@@ -126,6 +138,9 @@ INSTRUMENT_RULE_PROFILES = (
         code_ranges=((300000, 301999),),
         asset_class=AssetClass.EQUITY,
         product_type="cn_a_share_paper",
+        quote_currency="CNY",
+        settlement_currency="CNY",
+        calendar_id="CN-A-SHARE",
         price_scale=2,
         price_tick_units=1,
         lot=100,
@@ -137,6 +152,9 @@ INSTRUMENT_RULE_PROFILES = (
         code_ranges=((510000, 518999),),
         asset_class=AssetClass.ETF,
         product_type="cn_etf_paper",
+        quote_currency="CNY",
+        settlement_currency="CNY",
+        calendar_id="CN-A-SHARE",
         price_scale=3,
         price_tick_units=1,
         lot=100,
@@ -148,6 +166,9 @@ INSTRUMENT_RULE_PROFILES = (
         code_ranges=((158000, 159999),),
         asset_class=AssetClass.ETF,
         product_type="cn_etf_paper",
+        quote_currency="CNY",
+        settlement_currency="CNY",
+        calendar_id="CN-A-SHARE",
         price_scale=3,
         price_tick_units=1,
         lot=100,
@@ -446,6 +467,12 @@ def _assert_rule_consistency(
         mismatches.append("asset_class")
     if instrument.product_type != rule.product_type:
         mismatches.append("product_type")
+    if instrument.quote_currency != rule.quote_currency:
+        mismatches.append("quote_currency")
+    if instrument.settlement_currency != rule.settlement_currency:
+        mismatches.append("settlement_currency")
+    if instrument.calendar_id != rule.calendar_id:
+        mismatches.append("calendar_id")
     if instrument.price_tick != FixedPoint(rule.price_tick_units, rule.price_scale):
         mismatches.append("price_tick")
     if instrument.quantity_step != FixedPoint(rule.lot, 0):

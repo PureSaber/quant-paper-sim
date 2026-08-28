@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 import yaml
-from quant_data_kit import AssetClass
+from quant_data_kit import AssetClass, dataclass_payload
 
 from quant_paper_sim.engine import initialize, run_step, status
 from quant_paper_sim.execution import instrument_spec, normalize_symbol
@@ -22,7 +22,7 @@ from quant_paper_sim.instrument_catalog import (
     load_configured_catalog,
     load_instrument_catalog,
 )
-from quant_paper_sim.state import StateError, load_log
+from quant_paper_sim.state import StateError, load_log, sha256_payload
 
 UTC = timezone.utc
 ROOT = Path(__file__).resolve().parents[1]
@@ -46,6 +46,46 @@ def catalog_config(path: Path, catalog: InstrumentCatalog) -> dict[str, str]:
         "version": catalog.version,
         "certification_level": catalog.certification_level,
         "content_sha256": catalog.content_sha256,
+    }
+
+
+def normalized_catalog_hash_with_override(field: str, value: str) -> str:
+    catalog = load_bundled_catalog()
+    records = []
+    for record in catalog.records:
+        row = {
+            "rule_profile_id": record.rule_profile_id,
+            "instrument_spec": dataclass_payload(record.instrument),
+            "symbol_mapping": dataclass_payload(record.mapping),
+        }
+        if record.mapping.provider_symbol == "000001":
+            row["instrument_spec"][field] = value
+        records.append(row)
+    records.sort(
+        key=lambda row: (
+            row["symbol_mapping"]["provider_symbol"],
+            row["symbol_mapping"]["effective_from"],
+            row["symbol_mapping"]["available_at"],
+            row["instrument_spec"]["instrument_id"],
+        )
+    )
+    return sha256_payload(
+        {
+            "schema": "quant-paper-instrument-catalog/1.0.0",
+            "logical_id": catalog.logical_id,
+            "version": catalog.version,
+            "certification_level": catalog.certification_level,
+            "validity_semantics": catalog.validity_semantics,
+            "records": records,
+        }
+    )
+
+
+def state_file_bytes(state: Path) -> dict[str, bytes]:
+    return {
+        path.relative_to(state).as_posix(): path.read_bytes()
+        for path in state.rglob("*")
+        if path.is_file()
     }
 
 
@@ -214,6 +254,9 @@ def test_missing_damaged_duplicate_and_non_finite_catalogs_fail_closed(tmp_path:
         ("venue", "XSHE", "venue"),
         ("asset_class", "etf", "asset_class"),
         ("product_type", "cn_etf_paper", "product_type"),
+        ("quote_currency", "USD", "quote_currency"),
+        ("settlement_currency", "USD", "settlement_currency"),
+        ("calendar_id", "CRYPTO_24_7", "calendar_id"),
         ("price_tick", {"units": 1, "scale": 3}, "price_tick"),
         ("lot", 200, "lot"),
     ],
@@ -228,6 +271,74 @@ def test_catalog_metadata_must_match_rule_classification(
     path.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(StateError, match=message):
         load_instrument_catalog(path)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("quote_currency", "USD"),
+        ("settlement_currency", "USD"),
+        ("calendar_id", "CRYPTO_24_7"),
+    ],
+)
+def test_execution_metadata_conflict_fails_before_any_state_change(
+    tmp_path: Path, field: str, value: str
+) -> None:
+    valid_path = tmp_path / "catalog-valid.json"
+    shutil.copy(SNAPSHOT, valid_path)
+    valid_catalog = load_instrument_catalog(valid_path)
+    expected_original = {
+        "quote_currency": "CNY",
+        "settlement_currency": "CNY",
+        "calendar_id": "CN-A-SHARE",
+    }
+    assert (
+        normalized_catalog_hash_with_override(field, expected_original[field])
+        == valid_catalog.content_sha256
+    )
+    config, _, state = paper_case(
+        tmp_path,
+        catalog=catalog_config(valid_path, valid_catalog),
+    )
+    initialize(config)
+    before = state_file_bytes(state)
+    before_log = load_log(state / "execution_log.json")
+    before_artifacts = json.loads((state / "execution_artifacts.json").read_text(encoding="utf-8"))
+    assert len(before_log["steps"]) == 0
+    assert before_artifacts["orders"] == []
+    assert before_artifacts["fills"] == []
+
+    invalid_payload = catalog_payload()
+    row = next(item for item in invalid_payload["records"] if item["provider_symbol"] == "000001")
+    row[field] = value
+    invalid_path = tmp_path / f"catalog-wrong-{field}.json"
+    invalid_path.write_text(json.dumps(invalid_payload, indent=2), encoding="utf-8")
+    invalid_hash = normalized_catalog_hash_with_override(field, value)
+    assert invalid_hash != valid_catalog.content_sha256
+
+    raw_config = yaml.safe_load(config.read_text(encoding="utf-8"))
+    raw_config["instrument_catalog"]["path"] = str(invalid_path)
+    raw_config["instrument_catalog"]["content_sha256"] = invalid_hash
+    config.write_text(yaml.safe_dump(raw_config, sort_keys=False), encoding="utf-8")
+
+    fresh_config = tmp_path / f"fresh-{field}.yaml"
+    fresh_state = tmp_path / f"fresh-state-{field}"
+    fresh_raw = deepcopy(raw_config)
+    fresh_raw["state_dir"] = str(fresh_state)
+    fresh_config.write_text(yaml.safe_dump(fresh_raw, sort_keys=False), encoding="utf-8")
+    with pytest.raises(StateError, match=field):
+        initialize(fresh_config)
+    assert not fresh_state.exists()
+
+    with pytest.raises(StateError, match=field):
+        run_step(config)
+    assert state_file_bytes(state) == before
+    after_log = load_log(state / "execution_log.json")
+    after_artifacts = json.loads((state / "execution_artifacts.json").read_text(encoding="utf-8"))
+    assert len(after_log["steps"]) == len(before_log["steps"]) == 0
+    assert after_artifacts["orders"] == before_artifacts["orders"] == []
+    assert after_artifacts["fills"] == before_artifacts["fills"] == []
+    assert after_artifacts["ledger"] == before_artifacts["ledger"]
 
 
 def test_catalog_hash_path_semantics_and_replay_compatibility(tmp_path: Path) -> None:
