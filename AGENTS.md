@@ -21,6 +21,8 @@ Thin paper-trading CLI over the exact `quant-execution` v0.2.0 dependency.
   applicability, not listing history; never describe it as full-market or market-data-certified.
 - Board lot and price precision must come from the resolved `InstrumentSpec`; stocks use scale 2
   and certified ETFs use scale 3.
+- Quote currency, settlement currency and calendar must match the versioned rule profile; current
+  A-share/ETF profiles require `CNY`, `CNY` and `CN-A-SHARE` respectively.
 - Commission and stamp-duty rates must remain finite, non-negative and capped before replay.
 - CSV `top_n`, factors, prices and explicit weights must be validated without fallback weighting.
 - Do not add broker credentials, live adapters or order-transmission code.

@@ -138,6 +138,9 @@ duplicate instruments fail closed.
 - A-share prices use tick `CNY0.01`/scale 2. ETF prices use tick `CNY0.001`/scale 3; target,
   research Bar and limit-order precision all come from the same `InstrumentSpec`.
 - Stocks use `product_type=cn_a_share_paper`; ETFs use `product_type=cn_etf_paper`.
+- Every certified A-share/ETF rule requires quote currency `CNY`, settlement currency `CNY` and
+  calendar `CN-A-SHARE`; external fixture catalogs with conflicting execution metadata fail
+  before authoritative state is created or changed.
 - Commission and sell-side stock stamp duty are explicit configuration values; ETF stamp duty
   is zero. Both configured rates must be finite and in `[0, 0.1]`. The current generic ETF paper
   rule remains conservatively T+1.
