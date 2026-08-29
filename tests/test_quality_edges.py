@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
 from copy import deepcopy
 from decimal import Decimal
 from pathlib import Path
@@ -592,17 +594,74 @@ def test_state_schema_validation_and_atomic_cleanup(tmp_path: Path, monkeypatch)
         new_log(initial_cash=0, execution_config=config)
 
     target = tmp_path / "atomic.json"
-    original_replace = paper_state.os.replace
+    original_replace = paper_state._durable_replace
 
-    def fail_replace(source, destination):
-        del source, destination
+    def fail_replace(source, destination, **kwargs):
+        del source, destination, kwargs
         raise OSError("injected replace failure")
 
-    monkeypatch.setattr(paper_state.os, "replace", fail_replace)
+    monkeypatch.setattr(paper_state, "_durable_replace", fail_replace)
     with pytest.raises(OSError, match="injected"):
         paper_state.atomic_write_json(target, {"safe": True})
     assert not list(tmp_path.glob("*.tmp"))
-    monkeypatch.setattr(paper_state.os, "replace", original_replace)
+    monkeypatch.setattr(paper_state, "_durable_replace", original_replace)
+
+
+def test_nofollow_descriptor_identity_defenses_and_idempotent_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "identity.json"
+    target.write_bytes(b"trusted")
+    real_same_file = paper_state._same_file
+
+    monkeypatch.setattr(paper_state, "_same_file", lambda left, right: False)
+    with pytest.raises(StateError, match="identity changed while opening"):
+        paper_state.open_verified_regular(target, "identity test")
+
+    monkeypatch.setattr(paper_state, "_same_file", real_same_file)
+    guard = paper_state.open_verified_regular(target, "identity test", expected_bytes=b"trusted")
+    outcomes = iter((True, True, False))
+    monkeypatch.setattr(paper_state, "_same_file", lambda left, right: next(outcomes))
+    with pytest.raises(StateError, match="identity changed while verifying"):
+        guard.read_and_verify()
+    guard.close()
+    guard.close()
+
+    reparse = SimpleNamespace(st_mode=stat.S_IFREG, st_file_attributes=0x0400)
+    with pytest.raises(StateError, match="no-follow"):
+        paper_state._require_regular_stat(target, reparse, "reparse test")
+
+    if os.name == "nt":
+        with pytest.raises(StateError, match="directory fsync is unavailable"):
+            paper_state._sync_parent_directory(tmp_path)
+    else:
+        paper_state._sync_parent_directory(tmp_path)
+
+
+def test_archive_install_race_verifies_winner_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive = tmp_path / "archive.json"
+
+    def install_winner(source: Path, destination: Path) -> None:
+        del source
+        destination.write_bytes(b"winner")
+        raise FileExistsError
+
+    monkeypatch.setattr(paper_state, "_install_new_file", install_winner)
+    with paper_state.install_or_open_archive(archive, b"winner") as guard:
+        assert guard.read_and_verify() == b"winner"
+
+
+def test_state_writer_lock_path_identity_change_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(paper_state, "_same_file", lambda left, right: False)
+    with (
+        pytest.raises(StateError, match="lock identity changed"),
+        paper_state.state_writer_lock(tmp_path),
+    ):
+        pytest.fail("unsafe lock path must never enter the critical section")
 
 
 def test_state_path_properties_and_reader_failures(tmp_path: Path) -> None:

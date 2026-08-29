@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from copy import deepcopy
 from pathlib import Path
 
@@ -170,10 +171,10 @@ def test_migration_failure_keeps_historical_authority_and_repair_uses_log(
     config, _, state, historical_bytes = compatibility_case(tmp_path)
     real_write = paper_engine.atomic_write_json
 
-    def fail_new_authority(path: Path, payload: object) -> None:
+    def fail_new_authority(path: Path, payload: object, **kwargs: object) -> None:
         if path.name == "execution_log.json":
             raise OSError("injected migration commit failure")
-        real_write(path, payload)
+        real_write(path, payload, **kwargs)
 
     monkeypatch.setattr(paper_engine, "atomic_write_json", fail_new_authority)
     with pytest.raises(OSError, match="migration commit failure"):
@@ -231,6 +232,121 @@ def test_conflicting_historical_archive_and_non_file_state_paths_fail_closed(
     (state / "execution_log.json").mkdir()
     with pytest.raises(StateError, match="log path is not a regular file"):
         status(config)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink semantics are certified in Ubuntu CI")
+def test_canonical_archive_symlink_fails_before_authority_commit(tmp_path: Path) -> None:
+    config, _, state, historical_bytes = compatibility_case(tmp_path)
+    source_content_hash = json.loads(historical_bytes)["content_sha256"]
+    archive = state / f"execution_log.v0.2.0.{source_content_hash}.json"
+    archive.symlink_to("execution_log.json")
+
+    with pytest.raises(StateError, match="no-follow"):
+        run_step(config)
+
+    assert archive.is_symlink()
+    assert (state / "execution_log.json").read_bytes() == historical_bytes
+
+
+@pytest.mark.parametrize("attack", ["tamper", "replace"])
+def test_archive_is_reverified_immediately_before_authority_replace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    attack: str,
+) -> None:
+    if attack == "replace" and os.name == "nt":
+        pytest.skip("Windows keeps the verified archive descriptor non-delete-share open")
+    config, _, state, historical_bytes = compatibility_case(tmp_path)
+    real_write = paper_engine.atomic_write_json
+    attacked = False
+
+    def attack_before_replace(path: Path, payload: object, **kwargs: object) -> None:
+        nonlocal attacked
+        callback = kwargs.get("before_replace")
+        if path.name == "execution_log.json" and callable(callback):
+
+            def attack_then_verify() -> None:
+                nonlocal attacked
+                archive = next(iter(state.glob("execution_log.v0.2.0.*.json")))
+                if attack == "tamper":
+                    archive.write_bytes(b"tampered-before-authority")
+                else:
+                    archive.unlink()
+                    archive.write_bytes(historical_bytes)
+                attacked = True
+                callback()
+
+            kwargs["before_replace"] = attack_then_verify
+        real_write(path, payload, **kwargs)
+
+    monkeypatch.setattr(paper_engine, "atomic_write_json", attack_before_replace)
+    with pytest.raises(StateError, match="content changed|identity changed"):
+        run_step(config)
+
+    assert attacked
+    assert (state / "execution_log.json").read_bytes() == historical_bytes
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows uses write-through moves, not directory fsync")
+def test_archive_directory_is_synced_before_authority_replace_and_pending_clear(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, _, _, _ = compatibility_case(tmp_path)
+    events: list[str] = []
+    real_link = paper_state.os.link
+    real_replace = paper_state.os.replace
+    real_sync = paper_state._sync_parent_directory
+    real_clear = paper_engine.durable_unlink
+
+    def observed_link(source: object, destination: object, **kwargs: object) -> None:
+        events.append(f"link:{Path(destination).name}")
+        real_link(source, destination, **kwargs)
+
+    def observed_replace(source: object, destination: object) -> None:
+        events.append(f"replace:{Path(destination).name}")
+        real_replace(source, destination)
+
+    def observed_sync(directory: Path) -> None:
+        events.append("directory-fsync")
+        real_sync(directory)
+
+    def observed_clear(path: Path) -> None:
+        events.append(f"clear:{path.name}")
+        real_clear(path)
+
+    monkeypatch.setattr(paper_state.os, "link", observed_link)
+    monkeypatch.setattr(paper_state.os, "replace", observed_replace)
+    monkeypatch.setattr(paper_state, "_sync_parent_directory", observed_sync)
+    monkeypatch.setattr(paper_engine, "durable_unlink", observed_clear)
+
+    run_step(config)
+
+    archive_link = next(index for index, event in enumerate(events) if event.startswith("link:"))
+    archive_sync = events.index("directory-fsync", archive_link + 1)
+    pending_replace = events.index("replace:.paper_commit_pending.json")
+    authority_replace = events.index("replace:execution_log.json")
+    authority_sync = events.index("directory-fsync", authority_replace + 1)
+    pending_clear = events.index("clear:.paper_commit_pending.json")
+    assert archive_link < archive_sync < pending_replace
+    assert pending_replace < authority_replace < authority_sync < pending_clear
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows uses write-through moves, not directory fsync")
+def test_archive_directory_sync_failure_keeps_historical_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, _, state, historical_bytes = compatibility_case(tmp_path)
+
+    def fail_archive_sync(directory: Path) -> None:
+        del directory
+        raise OSError("injected archive directory fsync failure")
+
+    monkeypatch.setattr(paper_state, "_sync_parent_directory", fail_archive_sync)
+    with pytest.raises(OSError, match="archive directory fsync failure"):
+        run_step(config)
+
+    assert (state / "execution_log.json").read_bytes() == historical_bytes
+    assert not (state / ".paper_commit_pending.json").exists()
 
 
 @pytest.mark.parametrize(

@@ -5,7 +5,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 import tempfile
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
@@ -32,6 +35,303 @@ PENDING_FILE = ".paper_commit_pending.json"
 
 class StateError(RuntimeError):
     """The persisted paper state cannot be trusted or safely migrated."""
+
+
+_WINDOWS_REPARSE_POINT = 0x0400
+_WINDOWS_MOVEFILE_REPLACE_EXISTING = 0x00000001
+_WINDOWS_MOVEFILE_WRITE_THROUGH = 0x00000008
+
+
+def _is_reparse_point(info: os.stat_result) -> bool:
+    return bool(getattr(info, "st_file_attributes", 0) & _WINDOWS_REPARSE_POINT)
+
+
+def _require_regular_stat(path: Path, info: os.stat_result, purpose: str) -> None:
+    if stat.S_ISLNK(info.st_mode) or _is_reparse_point(info) or not stat.S_ISREG(info.st_mode):
+        raise StateError(f"{purpose} is not a regular file under no-follow semantics: {path}")
+
+
+def _regular_lstat(path: Path, purpose: str) -> os.stat_result:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        raise StateError(f"cannot inspect {purpose} {path}: {exc}") from exc
+    _require_regular_stat(path, info, purpose)
+    return info
+
+
+def regular_file_exists(path: Path, purpose: str) -> bool:
+    """Return whether path is a real regular file, rejecting links and reparse points."""
+
+    try:
+        _regular_lstat(path, purpose)
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _same_file(left: os.stat_result, right: os.stat_result) -> bool:
+    try:
+        return os.path.samestat(left, right)
+    except (AttributeError, OSError):
+        return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
+
+
+def _open_regular_descriptor(path: Path, purpose: str, *, writable: bool = False) -> int:
+    before = _regular_lstat(path, purpose)
+    flags = os.O_RDWR if writable else os.O_RDONLY
+    flags |= getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise StateError(f"cannot open {purpose} without following links {path}: {exc}") from exc
+    try:
+        opened = os.fstat(descriptor)
+        _require_regular_stat(path, opened, purpose)
+        after = _regular_lstat(path, purpose)
+        if not _same_file(before, opened) or not _same_file(opened, after):
+            raise StateError(f"{purpose} identity changed while opening: {path}")
+    except Exception:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+@dataclass
+class VerifiedRegularFile:
+    """A no-follow regular file whose descriptor and canonical path remain identical."""
+
+    path: Path
+    purpose: str
+    descriptor: int
+    expected_bytes: bytes | None = None
+
+    def read_and_verify(self) -> bytes:
+        opened = os.fstat(self.descriptor)
+        _require_regular_stat(self.path, opened, self.purpose)
+        current = _regular_lstat(self.path, self.purpose)
+        if not _same_file(opened, current):
+            raise StateError(f"{self.purpose} identity changed before commit: {self.path}")
+        os.lseek(self.descriptor, 0, os.SEEK_SET)
+        chunks: list[bytes] = []
+        while True:
+            block = os.read(self.descriptor, 1024 * 1024)
+            if not block:
+                break
+            chunks.append(block)
+        data = b"".join(chunks)
+        after_read = os.fstat(self.descriptor)
+        after_path = _regular_lstat(self.path, self.purpose)
+        if not _same_file(opened, after_read) or not _same_file(after_read, after_path):
+            raise StateError(f"{self.purpose} identity changed while verifying: {self.path}")
+        if self.expected_bytes is not None and data != self.expected_bytes:
+            raise StateError(f"{self.purpose} content changed before commit: {self.path}")
+        return data
+
+    def close(self) -> None:
+        if self.descriptor >= 0:
+            os.close(self.descriptor)
+            self.descriptor = -1
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        del exc_type, exc, traceback
+        self.close()
+
+
+def open_verified_regular(
+    path: Path,
+    purpose: str,
+    *,
+    expected_bytes: bytes | None = None,
+    writable: bool = False,
+) -> VerifiedRegularFile:
+    verified = VerifiedRegularFile(
+        path=path,
+        purpose=purpose,
+        descriptor=_open_regular_descriptor(path, purpose, writable=writable),
+        expected_bytes=expected_bytes,
+    )
+    try:
+        verified.read_and_verify()
+    except Exception:
+        verified.close()
+        raise
+    return verified
+
+
+def read_regular_bytes(path: Path, purpose: str) -> bytes:
+    with open_verified_regular(path, purpose) as verified:
+        return verified.read_and_verify()
+
+
+def _sync_parent_directory(directory: Path) -> None:
+    """Persist prior POSIX directory-entry changes; Windows uses write-through moves."""
+
+    if os.name == "nt":  # pragma: no branch - mutually exclusive platform implementation
+        raise StateError(
+            "directory fsync is unavailable on Windows; a write-through move is required"
+        )
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(directory, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _windows_move_file(source: Path, destination: Path, *, replace: bool) -> None:
+    import ctypes
+
+    flags = _WINDOWS_MOVEFILE_WRITE_THROUGH
+    if replace:
+        flags |= _WINDOWS_MOVEFILE_REPLACE_EXISTING
+    move_file = ctypes.WinDLL("kernel32", use_last_error=True).MoveFileExW
+    move_file.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32]
+    move_file.restype = ctypes.c_int
+    if move_file(str(source), str(destination), flags):
+        return
+    error = ctypes.get_last_error()
+    if not replace and error in {80, 183}:
+        raise FileExistsError(error, os.strerror(error), str(destination))
+    raise OSError(error, os.strerror(error), str(destination))
+
+
+def _durable_replace(
+    source: Path,
+    destination: Path,
+    *,
+    before_replace: Callable[[], None] | None = None,
+) -> None:
+    if before_replace is not None:
+        before_replace()
+    if os.name == "nt":  # pragma: no branch - mutually exclusive platform implementation
+        _windows_move_file(source, destination, replace=True)
+        return
+    os.replace(source, destination)
+    _sync_parent_directory(destination.parent)
+
+
+def _install_new_file(source: Path, destination: Path) -> None:
+    """Install a new canonical file without ever replacing an existing path."""
+
+    if os.name == "nt":  # pragma: no branch - mutually exclusive platform implementation
+        _windows_move_file(source, destination, replace=False)
+        return
+    os.link(source, destination, follow_symlinks=False)
+    _sync_parent_directory(destination.parent)
+    source.unlink()
+    _sync_parent_directory(destination.parent)
+
+
+def install_or_open_archive(path: Path, data: bytes) -> VerifiedRegularFile:
+    """Create a durable archive exclusively or verify the exact existing regular file."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not regular_file_exists(path, "historical authoritative log archive"):
+        descriptor, raw_temp = tempfile.mkstemp(
+            prefix=f".{path.name}.", suffix=".archive.tmp", dir=path.parent
+        )
+        temp_path = Path(raw_temp)
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            try:
+                _install_new_file(temp_path, path)
+            except FileExistsError:
+                # Another conforming writer won the exclusive install; verify its exact bytes.
+                pass
+        finally:
+            temp_path.unlink(missing_ok=True)
+    verified = open_verified_regular(
+        path,
+        "historical authoritative log archive",
+        expected_bytes=data,
+        writable=True,
+    )
+    try:
+        os.fsync(verified.descriptor)
+        if os.name != "nt":  # pragma: no branch - mutually exclusive platform implementation
+            _sync_parent_directory(path.parent)
+        verified.read_and_verify()
+    except Exception:
+        verified.close()
+        raise
+    return verified
+
+
+def durable_unlink(path: Path) -> None:
+    """Durably clear a marker without following it."""
+
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return
+    if os.name == "nt":  # pragma: no branch - mutually exclusive platform implementation
+        tombstone = path.with_name(f".{path.name}.cleared")
+        _windows_move_file(path, tombstone, replace=True)
+        tombstone.unlink(missing_ok=True)
+        return
+    path.unlink()
+    _sync_parent_directory(path.parent)
+
+
+@contextmanager
+def state_writer_lock(root: Path) -> Iterator[None]:
+    """Serialize state writers and reject lock-path links/reparse points."""
+
+    root.mkdir(parents=True, exist_ok=True)
+    lock_path = root / ".paper_state.lock"
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(lock_path, flags, 0o600)
+    except OSError as exc:
+        raise StateError(f"cannot safely open paper state writer lock: {exc}") from exc
+    locked = False
+    try:
+        opened = os.fstat(descriptor)
+        _require_regular_stat(lock_path, opened, "paper state writer lock")
+        current = _regular_lstat(lock_path, "paper state writer lock")
+        if not _same_file(opened, current):
+            raise StateError("paper state writer lock identity changed while opening")
+        if os.name == "nt":  # pragma: no branch - mutually exclusive platform implementation
+            import msvcrt
+
+            if opened.st_size == 0:
+                os.write(descriptor, b"\0")
+                os.fsync(descriptor)
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            try:
+                msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+            except OSError as exc:
+                raise StateError("paper state is already being modified") from exc
+        else:
+            import fcntl
+
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                raise StateError("paper state is already being modified") from exc
+        locked = True
+        yield
+    finally:
+        if locked:
+            if os.name == "nt":  # pragma: no branch - mutually exclusive platform implementation
+                import msvcrt
+
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
 
 
 def _require_current_runtime() -> None:
@@ -143,11 +443,7 @@ def sha256_payload(value: object) -> str:
 
 
 def file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
+    return hashlib.sha256(read_regular_bytes(path, "state file")).hexdigest()
 
 
 def _decimal_text(value: object, field: str, *, positive: bool = False) -> str:
@@ -292,13 +588,18 @@ def migrate_historical_log(payload: dict[str, Any], *, source_file_sha256: str) 
 
 def load_log(path: Path) -> dict[str, Any]:
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        payload = json.loads(read_regular_bytes(path, "authoritative execution log"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise StateError(f"cannot read authoritative execution log {path}: {exc}") from exc
     return validate_log(payload)
 
 
-def atomic_write_bytes(path: Path, data: bytes) -> None:
+def atomic_write_bytes(
+    path: Path,
+    data: bytes,
+    *,
+    before_replace: Callable[[], None] | None = None,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, raw_temp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     temp_path = Path(raw_temp)
@@ -307,14 +608,23 @@ def atomic_write_bytes(path: Path, data: bytes) -> None:
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temp_path, path)
+        _durable_replace(temp_path, path, before_replace=before_replace)
     except Exception:
         temp_path.unlink(missing_ok=True)
         raise
 
 
-def atomic_write_json(path: Path, payload: object) -> None:
-    atomic_write_bytes(path, json.dumps(payload, indent=2, ensure_ascii=False).encode("utf-8"))
+def atomic_write_json(
+    path: Path,
+    payload: object,
+    *,
+    before_replace: Callable[[], None] | None = None,
+) -> None:
+    atomic_write_bytes(
+        path,
+        json.dumps(payload, indent=2, ensure_ascii=False).encode("utf-8"),
+        before_replace=before_replace,
+    )
 
 
 @dataclass(frozen=True)

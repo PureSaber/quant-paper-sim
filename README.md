@@ -113,7 +113,18 @@ The following files are compatibility projections only and are regenerated from 
   transactions)
 - `projection_manifest.json`
 
-Writes use same-directory temporary files, fsync and atomic replacement. A
+State writers are serialized by a no-follow lock. Authority, archive and pending reads use
+`lstat` plus a held no-follow regular-file descriptor; symlinks and detectable Windows reparse
+points fail closed. The historical archive is installed exclusively, kept open through the
+migration, and its path identity and exact bytes are checked again immediately before authority
+replacement.
+
+Writes use same-directory temporary files, file fsync and atomic replacement. On POSIX, every
+archive install, replacement and pending-marker removal is followed by parent-directory fsync.
+Windows cannot provide POSIX directory fsync through Python; it therefore uses
+`MoveFileExW(..., MOVEFILE_WRITE_THROUGH)` for installs/replacements and durably renames the
+active pending marker to a harmless tombstone before best-effort tombstone cleanup. The code does
+not treat an unsupported Windows directory fsync as success. A
 `.paper_commit_pending.json` marker makes interrupted multi-file projection commits detectable;
 when an older authoritative log still exists, the next valid command replays that log and repairs
 the projections. If the log is absent, any pending marker, projection manifest, execution artifact,
