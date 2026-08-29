@@ -1,10 +1,14 @@
 # quant-paper-sim
 
-Thin paper-trading CLI over the exact `quant-execution` v0.2.0 dependency.
+Thin paper-trading CLI over the exact `quant-execution` v0.4.1 dependency.
 
 ## Invariants
 
 - `state/execution_log.json` is authoritative; compatibility JSON/CSV files are projections.
+- New logs record exact versions 0.2.1/0.4.1. Historical 0.2.0/0.2.0 logs use only the
+  explicit frozen-opening compatibility profile; unknown tuples fail closed.
+- `status` must not rewrite historical authoritative bytes. The first appended step must preserve
+  a byte-identical, hash-anchored historical archive before committing migrated authority.
 - Missing journals plus any v2 pending/projection evidence must fail closed; never migrate v2
   projection cash as a legacy portfolio.
 - Cash, positions, NAV, orders, fills and fees must come from `quant-execution` replay.

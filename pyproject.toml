@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "quant-paper-sim"
-version = "0.2.0"
+version = "0.2.1"
 description = "Thin deterministic paper CLI over quant-execution"
 readme = "README.md"
 license = { text = "MIT" }
@@ -12,11 +12,30 @@ requires-python = ">=3.10"
 dependencies = [
     "pandas>=2.0,<3.0",
     "pyyaml>=6.0,<7.0",
-    "quant-execution @ git+https://github.com/PureSaber/quant-execution.git@v0.2.0",
+    "quant-execution @ git+https://github.com/PureSaber/quant-execution.git@v0.4.1",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0,<10.0", "pytest-cov>=5.0,<8.0", "ruff==0.16.5"]
+dev = [
+    "exceptiongroup>=1; python_version < '3.11'",
+    "pytest>=8.0,<10.0",
+    "pytest-cov>=5.0,<8.0",
+    "ruff==0.16.5",
+    "tomli>=1; python_version < '3.11'",
+]
+
+[tool.quant-workspace]
+layer = "execution"
+schemas = [
+    { id = "quant-paper-execution-log", version = "1.0.0" },
+    { id = "puresaber.execution.order", version = "1.1.0" },
+    { id = "puresaber.execution.order-event", version = "1.1.0" },
+    { id = "puresaber.execution.fill", version = "1.1.0" },
+    { id = "puresaber.execution.fee", version = "1.1.0" },
+    { id = "puresaber.execution.ledger-transaction", version = "1.1.0" },
+    { id = "puresaber.execution.run-result", version = "1.1.0" },
+]
+lock-files = ["requirements.lock"]
 
 [project.scripts]
 quant-paper = "quant_paper_sim.cli:main"

@@ -1,17 +1,23 @@
 # quant-paper-sim
 
-`quant-paper-sim`v0.2 is a thin, deterministic CLI adapter over
-[`quant-execution`](https://github.com/PureSaber/quant-execution) v0.2.0. It does not
+`quant-paper-sim`v0.2.1 is a thin, deterministic CLI adapter over
+[`quant-execution`](https://github.com/PureSaber/quant-execution) annotated tag`v0.4.1`
+(peeled commit`29eccc0e392968b5f7c31976a329605aacce369a`). It does not
 maintain a second portfolio implementation and it has no live-order path.
 
 ## Commands
 
 ```bash
-pip install -e ".[dev]"
+python -m pip install --no-deps -r requirements.lock
+python -m pip check
+python -m pip install --no-deps --no-build-isolation -e .
+python -m pip check
 quant-paper init --config configs/default.yaml
 quant-paper step --config configs/default.yaml
 quant-paper status --config configs/default.yaml
-pytest --cov=quant_paper_sim --cov-branch --cov-fail-under=80 -q
+python -m pytest --cov=quant_paper_sim --cov-branch --cov-report=json:coverage.json -q
+python -m coverage report --fail-under=80
+python tools/check_branch_coverage.py coverage.json --threshold 90 state execution engine
 ```
 
 The existing pipeline entry point remains supported without a preceding `init`:
@@ -69,6 +75,34 @@ provenance explicitly.
 `step` and `status` replay the complete journal into `ExactAccountLedger`; they never restore
 cash or positions from `portfolio.json`.
 
+### Exact version compatibility
+
+State compatibility is an allowlist, not a broad version fallback:
+
+- New state is exactly`quant-paper-sim 0.2.1 + quant-execution 0.4.1`. It uses the current
+  causal opening-time policy and records both versions in the authoritative log.
+- Historical state is exactly`quant-paper-sim 0.2.0 + quant-execution 0.2.0`. It is replayed
+  by the same0.4.1 engine and`ExactAccountLedger`, with only the historical1970-01-01 UTC
+  opening-time policy restored. This is required because0.3.0 made ledger opening causal;
+  without the explicit policy, order and fill hashes remain equal but ledger and result hashes
+  change.
+- Any other schema/package-version tuple fails closed. A migrated log must contain the exact
+  migration kind, replay profile, source versions, canonical archive name and two SHA-256s.
+
+`status` treats a0.2.0 journal as read-only: it verifies all persisted event, fill, order,
+ledger and result hashes, regenerates projections, and never rewrites the authoritative bytes.
+On the first`step`, the old journal is copied byte-for-byte to
+`execution_log.v0.2.0.<content_sha256>.json` before a0.4.1 compatibility journal is committed.
+The new journal anchors the archive's content and file hashes. Future reads require that archive
+to remain present and unchanged. An interrupted migration leaves the old journal authoritative;
+the next replay repairs projections from that journal, never from projection cash or holdings.
+
+Execution artifact JSON supports the frozen`1.0.0`and current`1.1.0`schemas through
+`quant-execution`validators. New projections declare and write`1.1.0`; compatibility tests
+validate orders, order events, fills, fees, ledger transactions and run results against both
+versions. The authoritative paper journal remains`quant-paper-execution-log/1.0.0`because its
+shape did not change; package-version tuples and migration metadata select the exact replay policy.
+
 The following files are compatibility projections only and are regenerated from replay:
 
 - `portfolio.json`
@@ -79,7 +113,18 @@ The following files are compatibility projections only and are regenerated from 
   transactions)
 - `projection_manifest.json`
 
-Writes use same-directory temporary files, fsync and atomic replacement. A
+State writers are serialized by a no-follow lock. Authority, archive and pending reads use
+`lstat` plus a held no-follow regular-file descriptor; symlinks and detectable Windows reparse
+points fail closed. The historical archive is installed exclusively, kept open through the
+migration, and its path identity and exact bytes are checked again immediately before authority
+replacement.
+
+Writes use same-directory temporary files, file fsync and atomic replacement. On POSIX, every
+archive install, replacement and pending-marker removal is followed by parent-directory fsync.
+Windows cannot provide POSIX directory fsync through Python; it therefore uses
+`MoveFileExW(..., MOVEFILE_WRITE_THROUGH)` for installs/replacements and durably renames the
+active pending marker to a harmless tombstone before best-effort tombstone cleanup. The code does
+not treat an unsupported Windows directory fsync as success. A
 `.paper_commit_pending.json` marker makes interrupted multi-file projection commits detectable;
 when an older authoritative log still exists, the next valid command replays that log and repairs
 the projections. If the log is absent, any pending marker, projection manifest, execution artifact,
@@ -161,3 +206,23 @@ and [158-range expansion notice](https://www.szse.cn/marketServices/technicalser
 `quant-risk-monitor` can continue reading `holdings.csv` and `nav.csv`. `quant-pipeline` can
 continue invoking `quant-paper step --config configs/pipeline.yaml`; config-relative and
 repository-root-relative data paths retain their existing resolution order.
+
+## Reproducible lock and rollback
+
+`requirements.lock`is generated under Python3.10 and includes runtime, dev and editable-build
+dependencies. Rebuild it only from`pyproject.toml`and`requirements-constraints.txt`:
+
+```bash
+python3.10 -m pip install pip-tools==7.6.1
+python3.10 -m piptools compile --extra dev --build-deps-for editable \
+  --allow-unsafe --strip-extras --resolver backtracking \
+  --index-url https://pypi.org/simple \
+  --constraint requirements-constraints.txt \
+  --output-file requirements.lock pyproject.toml
+```
+
+Rollback source with`git revert <merge-commit>`and rerun the locked three-version CI; never move
+or rebuild`v0.2.0`. A state already migrated to0.2.1 is not readable by0.2.0. For a state-level
+rollback, stop the process, preserve the migrated directory, copy the hash-verified historical
+archive into a new isolated state directory as`execution_log.json`, and run0.2.1`status`to verify
+it before any further step. Do not edit either authoritative journal in place.
