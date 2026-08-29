@@ -1,0 +1,84 @@
+{
+  "schema": "quant-paper-execution-log/1.0.0",
+  "quant_paper_sim_version": "0.2.0",
+  "quant_execution_version": "0.2.0",
+  "account_id": "paper-account",
+  "strategy_id": "paper-rebalance-v2",
+  "base_currency": "CNY",
+  "initial_cash": "10000.0",
+  "execution_config": {
+    "commission_rate": "0.0003",
+    "stamp_duty_rate": "0.0005",
+    "instrument_rule_profile": "cn-exchange-product-rules-2026-08",
+    "instrument_catalog": {
+      "schema": "quant-paper-instrument-catalog/1.0.0",
+      "logical_id": "cn-a-core-paper-fixture",
+      "version": "1.0.0",
+      "certification_level": "fixture-certified",
+      "validity_semantics": "fixture_certification_applicability_not_listing_history",
+      "content_sha256": "d37ed48c446e7d99a37c1989cf7d466ef30ab338c099401b299a237b89dec369"
+    },
+    "price_precision": "per_instrument_spec",
+    "money_scale": 8,
+    "bar_participation_rate": "1",
+    "slippage_ticks": 0,
+    "seed": 42,
+    "market_data_mode": "paper_research_close_not_live",
+    "stale_exit_price_policy": "last_known_signal_close"
+  },
+  "steps": [
+    {
+      "as_of": "2026-07-28T07:00:00+00:00",
+      "trading_day": "2026-07-28",
+      "signal_source": {
+        "kind": "yaml",
+        "path": "fixture://quant-paper-sim/v0.2.0/signals.yaml",
+        "sha256": "a3eeb52d72c70eae9b75be2ba4089efeb006f5d14c7a6e9cd06598e32e9f7c93",
+        "market_data_semantics": "paper_research_close_not_live"
+      },
+      "targets": [
+        {
+          "symbol": "000001",
+          "native_symbol": "000001.XSHE",
+          "instrument_id": "CN.XSHE.000001",
+          "weight": "1.0",
+          "price": "10.00",
+          "price_fixed": {
+            "units": 1000,
+            "scale": 2
+          },
+          "price_scale": 2,
+          "rule_profile_id": "szse-main-a-v1",
+          "lot_size": 100,
+          "instrument_spec_sha256": "d24fc5b12284923050109dc999f296918dab20406d940eb45219a67ac5152313"
+        }
+      ],
+      "regime_scale": "1.0",
+      "cash_reserve": "0.05",
+      "input_sha256": "bfcf3964eb87f0ba2576281664099b575e9fb6e924852bb9d83e217f68bb8ce8",
+      "replay_evidence": {
+        "fill_ids": [
+          "fill-8b619fa8f536cb348410dc08"
+        ],
+        "event_ids": [
+          "paper:0:mark:CN.XSHE.000001",
+          "paper:0:submit-sell",
+          "paper:0:submit-buy",
+          "paper:0:fill-buy:CN.XSHE.000001"
+        ]
+      },
+      "cumulative_result": {
+        "run_id": "quant-paper-v2",
+        "seed": 42,
+        "event_count": 4,
+        "order_count": 1,
+        "fill_count": 1,
+        "order_sha256": "b838c29cd37ef66ea982a4d73e2b75c687a4673f7000868145c6e1b84eb99485",
+        "fill_sha256": "e26617c9b37ea9245e2808c1887184231ac69ef51d4133e2aa37ac2b6bf9c309",
+        "ledger_sha256": "41739ee5463ce11dfae634f692b26bfc76c1bfb668a6c0abc20585532dd0d8ff",
+        "result_sha256": "6f4a5f79cc9ea2a8b5338fc751ccc8b2e0cce96965f19fa14b9a7483d3e5e9fd"
+      }
+    }
+  ],
+  "content_sha256": "1ee8a6a22fb92ef7ef03b3c0de43b2b98817b1fe20943829c3937226727efbfc"
+}

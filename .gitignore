@@ -2,9 +2,12 @@ __pycache__/
 *.egg-info/
 build/
 .venv/
+.venv*/
 venv/
+.compat/
 .pytest_cache/
 .ruff_cache/
 .coverage
+.coverage.*
 coverage.json
 state/
