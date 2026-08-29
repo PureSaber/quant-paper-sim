@@ -2,6 +2,6 @@
   "name": "quant-paper-sim",
   "private": true,
   "scripts": {
-    "lint": "ruff check src tests"
+    "lint": "ruff check src tests tools && ruff format --check src tests tools"
   }
 }

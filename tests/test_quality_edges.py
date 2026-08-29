@@ -574,7 +574,7 @@ def test_state_schema_validation_and_atomic_cleanup(tmp_path: Path, monkeypatch)
     for mutation, message in (
         (lambda value: value.pop("schema"), "missing fields"),
         (lambda value: value.__setitem__("schema", "wrong"), "unsupported"),
-        (lambda value: value.__setitem__("quant_execution_version", "9"), "requires"),
+        (lambda value: value.__setitem__("quant_execution_version", "9"), "version tuple"),
         (lambda value: value.__setitem__("account_id", "other"), "identity"),
         (lambda value: value.__setitem__("execution_config", []), "execution_config"),
         (lambda value: value.__setitem__("steps", {}), "steps must"),

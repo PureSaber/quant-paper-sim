@@ -16,6 +16,13 @@ from quant_data_kit import (
 )
 from quant_data_kit.exceptions import ValidationError
 from quant_execution import (
+    FEE_SCHEMA_ID,
+    FILL_SCHEMA_ID,
+    LEDGER_TRANSACTION_SCHEMA_ID,
+    LEGACY_SCHEMA_VERSION,
+    ORDER_EVENT_SCHEMA_ID,
+    ORDER_SCHEMA_ID,
+    SCHEMA_VERSION,
     BarMatchingModel,
     DeterministicBroker,
     DeterministicRunEngine,
@@ -26,6 +33,7 @@ from quant_execution import (
     Side,
     TimeInForce,
     execution_payload,
+    validate_json_record,
 )
 
 from quant_paper_sim.instrument_catalog import (
@@ -37,7 +45,13 @@ from quant_paper_sim.instrument_catalog import (
     classify_symbol_rule,
     load_bundled_catalog,
 )
-from quant_paper_sim.state import StateError, sha256_payload
+from quant_paper_sim.state import (
+    CURRENT_REPLAY_PROFILE,
+    HISTORICAL_REPLAY_PROFILE,
+    StateError,
+    replay_profile,
+    sha256_payload,
+)
 
 UTC = timezone.utc
 MONEY_SCALE = 8
@@ -226,14 +240,29 @@ class CompiledReplay:
     latest_price_sources: dict[str, str]
 
 
+class _HistoricalOpeningLedger(ExactAccountLedger):
+    """Use quant-execution's ledger with its v0.2.0 opening-time policy."""
+
+    def reset(self, *, opened_at: datetime | None = None) -> None:
+        del opened_at
+        super().reset(opened_at=datetime(1970, 1, 1, tzinfo=UTC))
+
+
 def _runtime(
     *,
     events: list[BarEvent],
     intents: dict[str, tuple[OrderIntent, ...]],
     registry: dict[str, InstrumentSpec],
     initial_cash: str,
+    profile: str,
 ) -> ReplayRuntime:
-    ledger = ExactAccountLedger(
+    if profile == CURRENT_REPLAY_PROFILE:
+        ledger_type = ExactAccountLedger
+    elif profile == HISTORICAL_REPLAY_PROFILE:
+        ledger_type = _HistoricalOpeningLedger
+    else:
+        raise StateError(f"unsupported execution replay profile: {profile!r}")
+    ledger = ledger_type(
         account_id=ACCOUNT_ID,
         base_currency="CNY",
         instruments=registry,
@@ -347,6 +376,7 @@ def compile_log(
     *,
     catalog: InstrumentCatalog | None = None,
 ) -> CompiledReplay:
+    profile = replay_profile(log)
     config = log["execution_config"]
     active_catalog = catalog if catalog is not None else load_bundled_catalog()
     if config.get("instrument_rule_profile") != INSTRUMENT_RULE_PROFILE_VERSION:
@@ -398,7 +428,11 @@ def compile_log(
     sequence = 0
     previous_time: datetime | None = None
     empty_runtime = _runtime(
-        events=[], intents={}, registry=registry, initial_cash=log["initial_cash"]
+        events=[],
+        intents={},
+        registry=registry,
+        initial_cash=log["initial_cash"],
+        profile=profile,
     )
     current_runtime = empty_runtime
 
@@ -453,7 +487,11 @@ def compile_log(
             step_event_ids.append(event.event_id)
             cursor += timedelta(microseconds=1)
         current_runtime = _runtime(
-            events=events, intents=intents, registry=registry, initial_cash=log["initial_cash"]
+            events=events,
+            intents=intents,
+            registry=registry,
+            initial_cash=log["initial_cash"],
+            profile=profile,
         )
         desired = _desired_quantities(step, current_runtime.snapshot.nav.to_decimal())
         positions = {
@@ -514,7 +552,11 @@ def compile_log(
             cursor += timedelta(microseconds=1)
 
         after_sells = _runtime(
-            events=events, intents=intents, registry=registry, initial_cash=log["initial_cash"]
+            events=events,
+            intents=intents,
+            registry=registry,
+            initial_cash=log["initial_cash"],
+            profile=profile,
         )
         after_sell_positions = {
             instrument_id: value.to_decimal()
@@ -573,7 +615,11 @@ def compile_log(
             cursor += timedelta(microseconds=1)
 
         current_runtime = _runtime(
-            events=events, intents=intents, registry=registry, initial_cash=log["initial_cash"]
+            events=events,
+            intents=intents,
+            registry=registry,
+            initial_cash=log["initial_cash"],
+            profile=profile,
         )
         artifacts = current_runtime.engine.artifacts
         if artifacts is None:
@@ -606,7 +652,11 @@ def compile_log(
     )
 
 
-def artifact_payloads(compiled: CompiledReplay) -> dict[str, list[dict[str, Any]]]:
+def artifact_payloads(
+    compiled: CompiledReplay, *, schema_version: str = SCHEMA_VERSION
+) -> dict[str, list[dict[str, Any]]]:
+    if schema_version not in (LEGACY_SCHEMA_VERSION, SCHEMA_VERSION):
+        raise StateError(f"unsupported execution artifact schema version: {schema_version!r}")
     artifacts = compiled.runtime.engine.artifacts
     if artifacts is None:
         return {
@@ -617,11 +667,27 @@ def artifact_payloads(compiled: CompiledReplay) -> dict[str, list[dict[str, Any]
             "fees": [],
             "ledger": [],
         }
-    return {
+    payloads = {
         "market_events": [market_event_payload(value) for value in artifacts.market_events],
-        "orders": [execution_payload(value) for value in artifacts.orders],
-        "order_events": [execution_payload(value) for value in artifacts.order_events],
-        "fills": [execution_payload(value) for value in artifacts.fills],
-        "fees": [execution_payload(value) for value in artifacts.fees],
-        "ledger": [execution_payload(value) for value in artifacts.ledger_transactions],
+        "orders": [execution_payload(value, version=schema_version) for value in artifacts.orders],
+        "order_events": [
+            execution_payload(value, version=schema_version) for value in artifacts.order_events
+        ],
+        "fills": [execution_payload(value, version=schema_version) for value in artifacts.fills],
+        "fees": [execution_payload(value, version=schema_version) for value in artifacts.fees],
+        "ledger": [
+            execution_payload(value, version=schema_version)
+            for value in artifacts.ledger_transactions
+        ],
     }
+    schemas = {
+        "orders": ORDER_SCHEMA_ID,
+        "order_events": ORDER_EVENT_SCHEMA_ID,
+        "fills": FILL_SCHEMA_ID,
+        "fees": FEE_SCHEMA_ID,
+        "ledger": LEDGER_TRANSACTION_SCHEMA_ID,
+    }
+    for name, schema_id in schemas.items():
+        for payload in payloads[name]:
+            validate_json_record(schema_id, payload, schema_version)
+    return payloads

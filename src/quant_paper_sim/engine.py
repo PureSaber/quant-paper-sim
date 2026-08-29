@@ -12,7 +12,12 @@ from pathlib import Path
 from typing import Any
 
 from quant_data_kit import dataclass_payload
-from quant_execution import execution_payload
+from quant_execution import (
+    RUN_RESULT_SCHEMA_ID,
+    SCHEMA_VERSION,
+    execution_payload,
+    validate_json_record,
+)
 
 from quant_paper_sim.execution import (
     MONEY_SCALE,
@@ -40,7 +45,10 @@ from quant_paper_sim.state import (
     atomic_write_bytes,
     atomic_write_json,
     file_sha256,
+    is_compat_migrated_log,
+    is_historical_log,
     load_log,
+    migrate_historical_log,
     new_log,
     seal_log,
     sha256_payload,
@@ -195,7 +203,8 @@ def _validate_replay_evidence(log: dict[str, Any], compiled: CompiledReplay) -> 
         artifacts = compiled.runtime.engine.artifacts
         if artifacts is None:
             raise StateError("quant-execution did not produce replay artifacts")
-        actual = execution_payload(artifacts.result)
+        actual = execution_payload(artifacts.result, version=SCHEMA_VERSION)
+        validate_json_record(RUN_RESULT_SCHEMA_ID, actual, SCHEMA_VERSION)
         if expected is not None and expected != actual:
             raise StateError("replayed order/fill/ledger hashes differ from authoritative evidence")
 
@@ -288,11 +297,16 @@ def _projection_bytes(
     portfolio_payload = portfolio.to_dict()
     artifacts = artifact_payloads(compiled)
     run_artifacts = compiled.runtime.engine.artifacts
-    result = execution_payload(run_artifacts.result) if run_artifacts is not None else None
+    result = (
+        execution_payload(run_artifacts.result, version=SCHEMA_VERSION)
+        if run_artifacts is not None
+        else None
+    )
     portfolio_payload["_execution"] = {
         "authoritative_log": "execution_log.json",
         "authoritative_sha256": log["content_sha256"],
         "quant_execution_version": log["quant_execution_version"],
+        "execution_schema_version": SCHEMA_VERSION,
         "market_data_mode": "paper_research_close_not_live",
         "run_result": result,
     }
@@ -333,7 +347,11 @@ def _projection_bytes(
         ),
         "trades.json": json.dumps(trades, indent=2, ensure_ascii=False).encode("utf-8"),
         "execution_artifacts.json": json.dumps(
-            {"authoritative_sha256": log["content_sha256"], **artifacts},
+            {
+                "authoritative_sha256": log["content_sha256"],
+                "execution_schema_version": SCHEMA_VERSION,
+                **artifacts,
+            },
             indent=2,
             ensure_ascii=False,
         ).encode("utf-8"),
@@ -346,6 +364,8 @@ def _commit(
     compiled: CompiledReplay,
     portfolio: PortfolioState,
     trades: list[dict[str, Any]],
+    *,
+    write_authoritative: bool = True,
 ) -> None:
     sealed = validate_log(log)
     projections = _projection_bytes(compiled, sealed, portfolio, trades)
@@ -366,8 +386,40 @@ def _commit(
         },
     }
     atomic_write_json(paths.projection_manifest, manifest)
-    atomic_write_json(paths.log, sealed)
+    if write_authoritative:
+        atomic_write_json(paths.log, sealed)
     paths.pending.unlink(missing_ok=True)
+
+
+def _verify_migration_archive(paths: StatePaths, log: dict[str, Any]) -> None:
+    if not is_compat_migrated_log(log):
+        return
+    migration = log["migration"]
+    archive = paths.root / migration["source_archive"]
+    if not archive.is_file():
+        raise StateError("compatibility migration source archive is missing")
+    if file_sha256(archive) != migration["source_file_sha256"]:
+        raise StateError("compatibility migration source archive hash mismatch")
+    archived = load_log(archive)
+    if (
+        not is_historical_log(archived)
+        or archived["content_sha256"] != migration["source_content_sha256"]
+    ):
+        raise StateError("compatibility migration source archive identity mismatch")
+
+
+def _migrate_historical_authority(paths: StatePaths, historical: dict[str, Any]) -> dict[str, Any]:
+    source_bytes = paths.log.read_bytes()
+    source_file_hash = hashlib.sha256(source_bytes).hexdigest()
+    migrated = migrate_historical_log(historical, source_file_sha256=source_file_hash)
+    archive = paths.root / migrated["migration"]["source_archive"]
+    if archive.exists():
+        if not archive.is_file() or archive.read_bytes() != source_bytes:
+            raise StateError("historical authoritative log archive conflicts with source bytes")
+    else:
+        atomic_write_bytes(archive, source_bytes)
+    _verify_migration_archive(paths, migrated)
+    return migrated
 
 
 def _validate_pending_marker(paths: StatePaths) -> dict[str, Any] | None:
@@ -471,6 +523,7 @@ def _load_or_migrate(
         raise StateError("authoritative execution log path is not a regular file")
     if paths.log.is_file():
         log = load_log(paths.log)
+        _verify_migration_archive(paths, log)
         _assert_config_compatible(log, cfg, catalog)
         return log
     _assert_no_v2_residue_without_log(paths, pending)
@@ -508,12 +561,20 @@ def status(config_path: Path) -> PortfolioState:
     catalog = load_configured_catalog(cfg, config_path)
     paths = _state_paths(config_path, cfg)
     initial_capital = float(cfg.get("initial_capital", 100_000))
+    authority_existed = paths.log.is_file()
     log = _load_or_migrate(paths, cfg, catalog, initial_capital=initial_capital)
     compiled = _compile(log, catalog)
     as_of = log["steps"][-1]["as_of"] if log["steps"] else "init"
     portfolio = _portfolio_from(compiled, log, as_of)
     trades = _latest_trades(compiled)
-    _commit(paths, log, compiled, portfolio, trades)
+    _commit(
+        paths,
+        log,
+        compiled,
+        portfolio,
+        trades,
+        write_authoritative=not authority_existed,
+    )
     return portfolio
 
 
@@ -532,6 +593,8 @@ def run_step(config_path: Path) -> RebalanceResult:
         initial_capital=initial_capital,
         allow_fresh_step_bootstrap=True,
     )
+    if is_historical_log(log):
+        log = _migrate_historical_authority(paths, log)
     source = _source_provenance(cfg, config_path)
     signals = load_signals(cfg, config_path)
     step = _step_record(
@@ -564,7 +627,14 @@ def run_step(config_path: Path) -> RebalanceResult:
         "fill_ids": list(compiled.steps[-1].fill_ids),
         "event_ids": list(compiled.steps[-1].event_ids),
     }
-    candidate["steps"][-1]["cumulative_result"] = execution_payload(artifacts.result)
+    candidate["steps"][-1]["cumulative_result"] = execution_payload(
+        artifacts.result, version=SCHEMA_VERSION
+    )
+    validate_json_record(
+        RUN_RESULT_SCHEMA_ID,
+        candidate["steps"][-1]["cumulative_result"],
+        SCHEMA_VERSION,
+    )
     candidate = seal_log(candidate)
     compiled = _compile(candidate, catalog)
     portfolio = _portfolio_from(compiled, candidate, step["as_of"])

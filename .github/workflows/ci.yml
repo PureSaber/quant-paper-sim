@@ -22,10 +22,23 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install dependencies
-        run: pip install -e ".[dev]"
+        run: |
+          python -m pip install --no-deps --requirement requirements.lock
+          python -m pip check
+          python -m pip install --no-deps --no-build-isolation --editable .
+          python -m pip check
 
       - name: Ruff check
-        run: ruff check src tests
+        run: |
+          python -m ruff check src tests tools
+          python -m ruff format --check src tests tools
 
       - name: Pytest with branch coverage
-        run: pytest --cov=quant_paper_sim --cov-branch --cov-report=term-missing --cov-fail-under=80 -q
+        run: >-
+          python -m pytest --cov=quant_paper_sim --cov-branch
+          --cov-report=term-missing --cov-report=json:coverage.json -q
+
+      - name: Enforce coverage gates
+        run: |
+          python -m coverage report --fail-under=80
+          python tools/check_branch_coverage.py coverage.json --threshold 90 state execution engine
