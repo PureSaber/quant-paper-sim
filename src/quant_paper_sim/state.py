@@ -17,6 +17,13 @@ from quant_execution import __version__ as execution_version
 from quant_paper_sim import __version__ as paper_sim_version
 
 LOG_SCHEMA = "quant-paper-execution-log/1.0.0"
+CURRENT_PAPER_SIM_VERSION = "0.2.1"
+CURRENT_EXECUTION_VERSION = "0.4.1"
+HISTORICAL_PAPER_SIM_VERSION = "0.2.0"
+HISTORICAL_EXECUTION_VERSION = "0.2.0"
+CURRENT_REPLAY_PROFILE = "quant-execution/0.4.1-causal-opening"
+HISTORICAL_REPLAY_PROFILE = "quant-execution/0.2.0-frozen-opening"
+COMPAT_MIGRATION_KIND = "quant_execution_0_2_0_to_0_4_1_compat"
 LOG_FILE = "execution_log.json"
 PROJECTION_MANIFEST_FILE = "projection_manifest.json"
 EXECUTION_ARTIFACTS_FILE = "execution_artifacts.json"
@@ -25,6 +32,100 @@ PENDING_FILE = ".paper_commit_pending.json"
 
 class StateError(RuntimeError):
     """The persisted paper state cannot be trusted or safely migrated."""
+
+
+def _require_current_runtime() -> None:
+    if paper_sim_version != CURRENT_PAPER_SIM_VERSION:
+        raise StateError(
+            "quant-paper-sim runtime version mismatch: "
+            f"expected {CURRENT_PAPER_SIM_VERSION}, imported {paper_sim_version}"
+        )
+    if execution_version != CURRENT_EXECUTION_VERSION:
+        raise StateError(
+            "quant-execution runtime version mismatch: "
+            f"expected {CURRENT_EXECUTION_VERSION}, imported {execution_version}"
+        )
+
+
+def _is_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def is_historical_log(payload: dict[str, Any]) -> bool:
+    return (
+        payload.get("schema") == LOG_SCHEMA
+        and payload.get("quant_paper_sim_version") == HISTORICAL_PAPER_SIM_VERSION
+        and payload.get("quant_execution_version") == HISTORICAL_EXECUTION_VERSION
+    )
+
+
+def is_compat_migrated_log(payload: dict[str, Any]) -> bool:
+    migration = payload.get("migration")
+    return (
+        payload.get("schema") == LOG_SCHEMA
+        and payload.get("quant_paper_sim_version") == CURRENT_PAPER_SIM_VERSION
+        and payload.get("quant_execution_version") == CURRENT_EXECUTION_VERSION
+        and isinstance(migration, dict)
+        and migration.get("kind") == COMPAT_MIGRATION_KIND
+    )
+
+
+def _validate_compat_migration(payload: dict[str, Any]) -> None:
+    migration = payload.get("migration")
+    required = {
+        "kind",
+        "replay_profile",
+        "source_schema",
+        "source_quant_paper_sim_version",
+        "source_quant_execution_version",
+        "source_content_sha256",
+        "source_file_sha256",
+        "source_archive",
+    }
+    if not isinstance(migration, dict) or set(migration) != required:
+        raise StateError("compatibility migration metadata is malformed")
+    expected = {
+        "kind": COMPAT_MIGRATION_KIND,
+        "replay_profile": HISTORICAL_REPLAY_PROFILE,
+        "source_schema": LOG_SCHEMA,
+        "source_quant_paper_sim_version": HISTORICAL_PAPER_SIM_VERSION,
+        "source_quant_execution_version": HISTORICAL_EXECUTION_VERSION,
+    }
+    if any(migration.get(key) != value for key, value in expected.items()):
+        raise StateError("compatibility migration metadata is not supported")
+    if not _is_sha256(migration.get("source_content_sha256")) or not _is_sha256(
+        migration.get("source_file_sha256")
+    ):
+        raise StateError("compatibility migration hashes are malformed")
+    expected_archive = f"execution_log.v0.2.0.{migration['source_content_sha256']}.json"
+    if migration.get("source_archive") != expected_archive:
+        raise StateError("compatibility migration archive name is not canonical")
+
+
+def replay_profile(payload: dict[str, Any]) -> str:
+    versions = (
+        payload.get("schema"),
+        payload.get("quant_paper_sim_version"),
+        payload.get("quant_execution_version"),
+    )
+    historical = (LOG_SCHEMA, HISTORICAL_PAPER_SIM_VERSION, HISTORICAL_EXECUTION_VERSION)
+    current = (LOG_SCHEMA, CURRENT_PAPER_SIM_VERSION, CURRENT_EXECUTION_VERSION)
+    if versions == historical:
+        return HISTORICAL_REPLAY_PROFILE
+    if versions == current:
+        if is_compat_migrated_log(payload):
+            _validate_compat_migration(payload)
+            return HISTORICAL_REPLAY_PROFILE
+        return CURRENT_REPLAY_PROFILE
+    raise StateError(
+        "unsupported authoritative log version tuple: "
+        f"schema={versions[0]!r}, quant-paper-sim={versions[1]!r}, "
+        f"quant-execution={versions[2]!r}"
+    )
 
 
 def canonical_json(value: object) -> bytes:
@@ -66,10 +167,7 @@ def new_log(
     execution_config: dict[str, object],
     migration: dict[str, object] | None = None,
 ) -> dict[str, Any]:
-    if execution_version != "0.2.0":
-        raise StateError(
-            f"quant-execution version mismatch: expected 0.2.0, imported {execution_version}"
-        )
+    _require_current_runtime()
     payload: dict[str, Any] = {
         "schema": LOG_SCHEMA,
         "quant_paper_sim_version": paper_sim_version,
@@ -105,6 +203,7 @@ def step_input_payload(step: dict[str, Any]) -> dict[str, Any]:
 
 
 def validate_log(payload: object) -> dict[str, Any]:
+    _require_current_runtime()
     if not isinstance(payload, dict):
         raise StateError("authoritative execution log must be a JSON object")
     required = {
@@ -124,14 +223,7 @@ def validate_log(payload: object) -> dict[str, Any]:
         raise StateError(f"authoritative execution log is missing fields: {missing}")
     if payload["schema"] != LOG_SCHEMA:
         raise StateError(f"unsupported authoritative log schema: {payload['schema']!r}")
-    if paper_sim_version != "0.2.0" or payload["quant_paper_sim_version"] != "0.2.0":
-        raise StateError("authoritative log requires quant-paper-sim 0.2.0")
-    if execution_version != "0.2.0":
-        raise StateError(
-            f"quant-execution version mismatch: expected 0.2.0, imported {execution_version}"
-        )
-    if payload["quant_execution_version"] != "0.2.0":
-        raise StateError("authoritative log requires quant-execution 0.2.0")
+    replay_profile(payload)
     if (
         payload["account_id"] != "paper-account"
         or payload["strategy_id"] != "paper-rebalance-v2"
@@ -173,6 +265,29 @@ def validate_log(payload: object) -> dict[str, Any]:
         if not isinstance(step["targets"], list) or not step["targets"]:
             raise StateError(f"steps[{index}].targets must be a non-empty array")
     return deepcopy(payload)
+
+
+def migrate_historical_log(payload: dict[str, Any], *, source_file_sha256: str) -> dict[str, Any]:
+    historical = validate_log(payload)
+    if not is_historical_log(historical):
+        raise StateError("only an exact quant-paper-sim 0.2.0 log can use compatibility migration")
+    if not _is_sha256(source_file_sha256):
+        raise StateError("historical authoritative log file hash is malformed")
+    source_content_sha256 = historical["content_sha256"]
+    migrated = deepcopy(historical)
+    migrated["quant_paper_sim_version"] = CURRENT_PAPER_SIM_VERSION
+    migrated["quant_execution_version"] = CURRENT_EXECUTION_VERSION
+    migrated["migration"] = {
+        "kind": COMPAT_MIGRATION_KIND,
+        "replay_profile": HISTORICAL_REPLAY_PROFILE,
+        "source_schema": LOG_SCHEMA,
+        "source_quant_paper_sim_version": HISTORICAL_PAPER_SIM_VERSION,
+        "source_quant_execution_version": HISTORICAL_EXECUTION_VERSION,
+        "source_content_sha256": source_content_sha256,
+        "source_file_sha256": source_file_sha256,
+        "source_archive": f"execution_log.v0.2.0.{source_content_sha256}.json",
+    }
+    return seal_log(migrated)
 
 
 def load_log(path: Path) -> dict[str, Any]:
