@@ -28,6 +28,12 @@ from quant_paper_sim.state import (
     COMPAT_MIGRATION_KIND,
     CURRENT_EXECUTION_VERSION,
     CURRENT_PAPER_SIM_VERSION,
+    CURRENT_REPLAY_PROFILE,
+    HISTORICAL_REPLAY_PROFILE,
+    LOG_SCHEMA,
+    PREVIOUS_COMPAT_MIGRATION_KIND,
+    PREVIOUS_EXECUTION_VERSION,
+    PREVIOUS_PAPER_SIM_VERSION,
     StateError,
     load_log,
     migrate_historical_log,
@@ -163,6 +169,78 @@ def test_new_authoritative_state_records_current_versions(tmp_path: Path) -> Non
     assert current["quant_paper_sim_version"] == CURRENT_PAPER_SIM_VERSION
     assert current["quant_execution_version"] == CURRENT_EXECUTION_VERSION
     assert "migration" not in current
+
+
+def test_v021_native_status_is_read_only_and_first_step_archives_immediate_authority(
+    tmp_path: Path,
+) -> None:
+    config, _, state, _ = compatibility_case(tmp_path)
+    (state / "execution_log.json").unlink()
+    initialize(config)
+    previous = load_log(state / "execution_log.json")
+    previous["quant_paper_sim_version"] = PREVIOUS_PAPER_SIM_VERSION
+    previous["quant_execution_version"] = PREVIOUS_EXECUTION_VERSION
+    previous = seal_log(previous)
+    previous_bytes = json.dumps(previous, indent=2, ensure_ascii=False).encode("utf-8")
+    (state / "execution_log.json").write_bytes(previous_bytes)
+
+    status(config)
+    assert (state / "execution_log.json").read_bytes() == previous_bytes
+
+    run_step(config)
+    migrated = load_log(state / "execution_log.json")
+    migration = migrated["migration"]
+    archive = state / migration["source_archive"]
+    assert migrated["quant_paper_sim_version"] == CURRENT_PAPER_SIM_VERSION
+    assert migrated["quant_execution_version"] == CURRENT_EXECUTION_VERSION
+    assert migration["kind"] == COMPAT_MIGRATION_KIND
+    assert migration["source_quant_paper_sim_version"] == PREVIOUS_PAPER_SIM_VERSION
+    assert migration["source_quant_execution_version"] == PREVIOUS_EXECUTION_VERSION
+    assert migration["replay_profile"] == CURRENT_REPLAY_PROFILE
+    assert archive.read_bytes() == previous_bytes
+
+
+def test_v021_historical_compat_chain_is_preserved_and_recursively_verified(
+    tmp_path: Path,
+) -> None:
+    config, _, state, historical_bytes = compatibility_case(tmp_path)
+    historical = json.loads(historical_bytes)
+    historical_file_sha256 = hashlib.sha256(historical_bytes).hexdigest()
+    previous = deepcopy(historical)
+    previous["quant_paper_sim_version"] = PREVIOUS_PAPER_SIM_VERSION
+    previous["quant_execution_version"] = PREVIOUS_EXECUTION_VERSION
+    previous["migration"] = {
+        "kind": PREVIOUS_COMPAT_MIGRATION_KIND,
+        "replay_profile": HISTORICAL_REPLAY_PROFILE,
+        "source_schema": LOG_SCHEMA,
+        "source_quant_paper_sim_version": "0.2.0",
+        "source_quant_execution_version": "0.2.0",
+        "source_content_sha256": historical["content_sha256"],
+        "source_file_sha256": historical_file_sha256,
+        "source_archive": (f"execution_log.v0.2.0.{historical['content_sha256']}.json"),
+    }
+    previous = seal_log(previous)
+    previous_bytes = json.dumps(previous, indent=2, ensure_ascii=False).encode("utf-8")
+    legacy_archive = state / previous["migration"]["source_archive"]
+    legacy_archive.write_bytes(historical_bytes)
+    (state / "execution_log.json").write_bytes(previous_bytes)
+
+    status(config)
+    assert (state / "execution_log.json").read_bytes() == previous_bytes
+    run_step(config)
+
+    migrated = load_log(state / "execution_log.json")
+    migration = migrated["migration"]
+    immediate_archive = state / migration["source_archive"]
+    assert migration["source_quant_paper_sim_version"] == PREVIOUS_PAPER_SIM_VERSION
+    assert migration["source_quant_execution_version"] == PREVIOUS_EXECUTION_VERSION
+    assert migration["replay_profile"] == HISTORICAL_REPLAY_PROFILE
+    assert immediate_archive.read_bytes() == previous_bytes
+    assert legacy_archive.read_bytes() == historical_bytes
+
+    legacy_archive.write_bytes(b"tampered-nested-archive")
+    with pytest.raises(StateError, match="source archive hash mismatch"):
+        status(config)
 
 
 def test_migration_failure_keeps_historical_authority_and_repair_uses_log(
@@ -379,7 +457,7 @@ def test_runtime_mismatch_and_compat_metadata_fail_closed(
         (lambda value: value["migration"].pop("source_archive"), "metadata is malformed"),
         (
             lambda value: value["migration"].__setitem__("replay_profile", "wrong"),
-            "metadata is not supported",
+            "replay profile is not supported",
         ),
         (
             lambda value: value["migration"].__setitem__("source_file_sha256", "x" * 64),
