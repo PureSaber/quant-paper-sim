@@ -50,12 +50,13 @@ from quant_paper_sim.state import (
     file_sha256,
     install_or_open_archive,
     is_compat_migrated_log,
-    is_historical_log,
     load_log,
-    migrate_historical_log,
+    migrate_compatible_log,
     new_log,
     read_regular_bytes,
     regular_file_exists,
+    replay_profile,
+    requires_compat_migration,
     seal_log,
     sha256_payload,
     state_writer_lock,
@@ -416,33 +417,44 @@ def _verify_migration_archive(paths: StatePaths, log: dict[str, Any]) -> None:
         archived = validate_log(json.loads(archive_bytes))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise StateError("compatibility migration source archive is not valid JSON") from exc
+    source_identity = (
+        archived.get("schema"),
+        archived.get("quant_paper_sim_version"),
+        archived.get("quant_execution_version"),
+    )
+    expected_identity = (
+        migration["source_schema"],
+        migration["source_quant_paper_sim_version"],
+        migration["source_quant_execution_version"],
+    )
     if (
-        not is_historical_log(archived)
+        source_identity != expected_identity
         or archived["content_sha256"] != migration["source_content_sha256"]
     ):
         raise StateError("compatibility migration source archive identity mismatch")
+    if replay_profile(archived) != migration["replay_profile"]:
+        raise StateError("compatibility migration source archive replay profile mismatch")
+    _verify_migration_archive(paths, archived)
 
 
-def _migrate_historical_authority(
-    paths: StatePaths, historical: dict[str, Any]
+def _migrate_compatible_authority(
+    paths: StatePaths, prior: dict[str, Any]
 ) -> tuple[dict[str, Any], VerifiedRegularFile]:
-    source_bytes = read_regular_bytes(paths.log, "historical authoritative execution log")
+    source_bytes = read_regular_bytes(paths.log, "prior authoritative execution log")
     try:
         source_log = validate_log(json.loads(source_bytes))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise StateError("historical authoritative execution log changed during migration") from exc
-    if source_log != historical:
-        raise StateError("historical authoritative execution log changed during migration")
+        raise StateError("prior authoritative execution log changed during migration") from exc
+    if source_log != prior:
+        raise StateError("prior authoritative execution log changed during migration")
     source_file_hash = hashlib.sha256(source_bytes).hexdigest()
-    migrated = migrate_historical_log(historical, source_file_sha256=source_file_hash)
+    migrated = migrate_compatible_log(prior, source_file_sha256=source_file_hash)
     archive = paths.root / migrated["migration"]["source_archive"]
     try:
         archive_guard = install_or_open_archive(archive, source_bytes)
     except StateError as exc:
         if "content changed" in str(exc):
-            raise StateError(
-                "historical authoritative log archive conflicts with source bytes"
-            ) from exc
+            raise StateError("prior authoritative log archive conflicts with source bytes") from exc
         raise
     try:
         _verify_migration_archive(paths, migrated)
@@ -629,8 +641,8 @@ def run_step(config_path: Path) -> RebalanceResult:
                 initial_capital=initial_capital,
                 allow_fresh_step_bootstrap=True,
             )
-            if is_historical_log(log):
-                log, archive_guard = _migrate_historical_authority(paths, log)
+            if requires_compat_migration(log):
+                log, archive_guard = _migrate_compatible_authority(paths, log)
             source = _source_provenance(cfg, config_path)
             signals = load_signals(cfg, config_path)
             step = _step_record(
