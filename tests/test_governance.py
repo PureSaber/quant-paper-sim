@@ -10,8 +10,8 @@ except ModuleNotFoundError:  # pragma: no cover - exercised by Python3.10 CI.
 from quant_paper_sim import __version__
 
 ROOT = Path(__file__).resolve().parents[1]
-EXECUTION_TAG = "v0.4.1"
-EXECUTION_COMMIT = "29eccc0e392968b5f7c31976a329605aacce369a"
+EXECUTION_TAG = "v0.5.1"
+EXECUTION_COMMIT = "15e4e5c9dbaf2fe9b438732b2e94db295d5ea58c"
 
 
 def test_release_metadata_uses_exact_tag_schema_and_lock_contracts() -> None:
@@ -23,7 +23,7 @@ def test_release_metadata_uses_exact_tag_schema_and_lock_contracts() -> None:
     )
     schemas = {(item["id"], item["version"]) for item in workspace["schemas"]}
 
-    assert project["version"] == __version__ == "0.2.1"
+    assert project["version"] == __version__ == "0.2.2"
     assert dependency.endswith(f"@{EXECUTION_TAG}")
     assert workspace["layer"] == "execution"
     assert workspace["lock-files"] == ["requirements.lock"]
@@ -45,7 +45,7 @@ def test_lock_readme_and_ci_preserve_reproducible_release_evidence() -> None:
 
     assert "pip-compile with Python 3.10" in lock
     assert f"quant-execution.git@{EXECUTION_TAG}" in lock
-    assert "quant-data-kit.git@v0.6.1" in lock
+    assert "quant-data-kit.git@v0.8.1" in lock
     assert 'exceptiongroup==1.3.1 ; python_version < "3.11"' in lock
     assert 'tomli==2.4.1 ; python_version < "3.11"' in lock
     assert "setuptools==84.0.0" in lock
