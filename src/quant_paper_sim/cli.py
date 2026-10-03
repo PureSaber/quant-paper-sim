@@ -4,9 +4,10 @@ import argparse
 import json
 from pathlib import Path
 
+import yaml
 from quant_execution import ReplayError
 
-from quant_paper_sim.engine import initialize, run_step, status
+from quant_paper_sim.engine import initialize, preflight, run_step, status
 from quant_paper_sim.state import StateError
 
 
@@ -17,6 +18,7 @@ def main(argv: list[str] | None = None) -> None:
         ("step", "Load research-close signals and execute a paper rebalance"),
         ("init", "Reset authoritative paper execution state to cash"),
         ("status", "Replay authoritative state and print its portfolio projection"),
+        ("preflight", "Read and validate inputs without replaying or modifying the account"),
     ):
         item = sub.add_parser(command, help=help_text)
         item.add_argument("--config", required=True)
@@ -24,6 +26,9 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     config_path = Path(args.config)
     try:
+        if args.command == "preflight":
+            print(json.dumps(preflight(config_path), indent=2, ensure_ascii=False))
+            return
         if args.command == "init":
             result = initialize(config_path)
             print(f"initialized authoritative paper ledger cash={result.portfolio.cash:.2f}")
@@ -37,7 +42,7 @@ def main(argv: list[str] | None = None) -> None:
             return
         portfolio = status(config_path)
         print(json.dumps(portfolio.to_dict(), indent=2, ensure_ascii=False))
-    except (StateError, ReplayError, ValueError) as exc:
+    except (StateError, ReplayError, ValueError, OSError, yaml.YAMLError) as exc:
         parser.error(str(exc))
 
 

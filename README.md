@@ -15,6 +15,7 @@ python -m pip check
 quant-paper init --config configs/default.yaml
 quant-paper step --config configs/default.yaml
 quant-paper status --config configs/default.yaml
+quant-paper preflight --config configs/default.yaml
 python -m pytest --cov=quant_paper_sim --cov-branch --cov-report=json:coverage.json -q
 python -m coverage report --fail-under=80
 python tools/check_branch_coverage.py coverage.json --threshold 90 state execution engine
@@ -25,6 +26,16 @@ The existing pipeline entry point remains supported without a preceding `init`:
 ```bash
 quant-paper step --config configs/pipeline.yaml
 ```
+
+`preflight`输出`quant.paper-preflight/v1`JSON，复用实际步进的信号、费用、
+历史时点证券身份、价格精度和资金约束校验，并检查已有登记日志的结构、配置、
+归档及信号日期冲突。它不执行回放、不生成订单、不取得写锁、不创建状态目录，
+也不迁移或刷新账户投影。缺少权威日志但残留v2投影时明确失败。
+这与会重新回放并刷新投影的`status`不同。
+
+预检通过仅说明所检查的输入和保存状态前置条件通过；已有成交证据的回放一致性、
+未来成交结果及真实市场适用性不在此命令的认证范围。预检不锁定文件，`step`
+仍重新读取并校验。输入缺失或非法时返回非零状态，不重新下载或修复源文件。
 
 On a completely new state directory, `step` records an explicit
 `fresh_step_bootstrap` migration and opens the configured cash ledger. `init` always resets
