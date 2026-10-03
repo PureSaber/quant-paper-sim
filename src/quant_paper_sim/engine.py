@@ -29,6 +29,7 @@ from quant_paper_sim.execution import (
     fixed,
     instrument_spec,
     parse_as_of,
+    validate_target_inputs,
     validated_fee_rate,
 )
 from quant_paper_sim.execution import normalize_symbol as _normalize_symbol
@@ -195,6 +196,7 @@ def _step_record(
         "regime_scale": format(decimal_value(signals.regime_scale, "regime_scale"), "f"),
         "cash_reserve": format(decimal_value(signals.cash_reserve, "cash_reserve"), "f"),
     }
+    validate_target_inputs(step)
     step["input_sha256"] = sha256_payload(step_input_payload(step))
     return step
 
@@ -623,6 +625,77 @@ def status(config_path: Path) -> PortfolioState:
         return portfolio
 
 
+def _is_existing_step(log: dict[str, Any], step: dict[str, Any]) -> bool:
+    matching = [item for item in log["steps"] if item["as_of"] == step["as_of"]]
+    if matching:
+        if matching[0]["input_sha256"] != step["input_sha256"]:
+            raise StateError("conflicting paper step content for the same as_of")
+        return True
+    if log["steps"] and step["as_of"] <= log["steps"][-1]["as_of"]:
+        raise StateError("paper steps must be appended in strictly increasing as_of order")
+    return False
+
+
+def preflight(config_path: Path) -> dict[str, Any]:
+    """Read inputs and saved state prerequisites, without replay, locks or writes."""
+    from quant_paper_sim.readers.signals import load_config, load_signals, resolve_data_path
+
+    config_hash = file_sha256(config_path)
+    cfg = load_config(config_path)
+    catalog = load_configured_catalog(cfg, config_path)
+    execution_config = _execution_config(cfg, catalog)
+    paths = _state_paths(config_path, cfg)
+    log = _load_or_migrate(
+        paths,
+        cfg,
+        catalog,
+        initial_capital=float(cfg.get("initial_capital", 100_000)),
+        allow_fresh_step_bootstrap=True,
+    )
+    source = _source_provenance(cfg, config_path)
+    regime_path = (cfg.get("regime") or {}).get("path")
+    inputs = {config_path: config_hash, Path(source["path"]): source["sha256"]}
+    if regime_path:
+        path = resolve_data_path(str(regime_path), config_path)
+        inputs[path] = file_sha256(path)
+    step = _step_record(
+        load_signals(cfg, config_path),
+        source=source,
+        catalog=catalog,
+        execution_config=execution_config,
+    )
+    existing = _is_existing_step(log, step)
+    if any(file_sha256(path) != digest for path, digest in inputs.items()):
+        raise StateError("paper input changed during preflight; retry with stable inputs")
+    return {
+        "schema_version": "quant.paper-preflight/v1",
+        "software_preflight": "pass",
+        "read_only": True,
+        "investable": False,
+        "scope": "signals_configuration_and_saved_state_prerequisites",
+        "market_data_semantics": "paper_research_close_not_live",
+        "as_of": step["as_of"],
+        "symbols": len(step["targets"]),
+        "rows": len(step["targets"]),
+        "config_sha256": config_hash,
+        "signal_source": source,
+        "input_sha256": step["input_sha256"],
+        "instrument_catalog": catalog.execution_identity,
+        "saved_state": {
+            "authoritative_log_exists": paths.log.is_file(),
+            "steps": len(log["steps"]),
+            "compatible_migration_required": requires_compat_migration(log),
+            "same_step_already_saved": existing,
+        },
+        "limitations": [
+            "No strategy execution, account replay, order generation or state writes",
+            "Saved state structure, configuration and archives checked; replay evidence not checked",
+            "Preflight does not lock inputs; step revalidates before execution",
+            "Research-close prices and fixture catalog do not certify real market tradability",
+        ],
+    }
+
+
 def run_step(config_path: Path) -> RebalanceResult:
     from quant_paper_sim.readers.signals import load_config, load_signals
 
@@ -652,10 +725,7 @@ def run_step(config_path: Path) -> RebalanceResult:
                 execution_config=execution_config,
             )
 
-            matching = [item for item in log["steps"] if item["as_of"] == step["as_of"]]
-            if matching:
-                if matching[0]["input_sha256"] != step["input_sha256"]:
-                    raise StateError("conflicting paper step content for the same as_of")
+            if _is_existing_step(log, step):
                 compiled = _compile(log, catalog)
                 portfolio = _portfolio_from(compiled, log, step["as_of"])
                 trades = _latest_trades(compiled)
@@ -670,9 +740,6 @@ def run_step(config_path: Path) -> RebalanceResult:
                     ),
                 )
                 return RebalanceResult(portfolio=portfolio, trades=trades)
-            if log["steps"] and step["as_of"] <= log["steps"][-1]["as_of"]:
-                raise StateError("paper steps must be appended in strictly increasing as_of order")
-
             candidate = deepcopy(log)
             candidate["steps"].append(step)
             candidate = seal_log(candidate)

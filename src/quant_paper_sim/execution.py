@@ -343,7 +343,8 @@ def _intent(
     )
 
 
-def _desired_quantities(step: dict[str, Any], nav: Decimal) -> dict[str, int]:
+def validate_target_inputs(step: dict[str, Any]) -> tuple[Decimal, Decimal, Decimal]:
+    """Validate allocation inputs without producing orders or replaying an account."""
     reserve = decimal_value(step["cash_reserve"], "cash_reserve")
     scale = decimal_value(step["regime_scale"], "regime_scale")
     if not Decimal(0) <= reserve < Decimal(1):
@@ -355,8 +356,6 @@ def _desired_quantities(step: dict[str, Any], nav: Decimal) -> dict[str, int]:
     )
     if total <= 0:
         raise StateError("target weights must sum to a positive value")
-    investable = nav * (Decimal(1) - reserve) * scale
-    desired: dict[str, int] = {}
     for row in step["targets"]:
         weight = decimal_value(row["weight"], "target.weight")
         if weight < 0:
@@ -364,6 +363,16 @@ def _desired_quantities(step: dict[str, Any], nav: Decimal) -> dict[str, int]:
         price = decimal_value(row["price"], "target.price")
         if price <= 0:
             raise StateError("target price must be positive")
+    return reserve, scale, total
+
+
+def _desired_quantities(step: dict[str, Any], nav: Decimal) -> dict[str, int]:
+    reserve, scale, total = validate_target_inputs(step)
+    investable = nav * (Decimal(1) - reserve) * scale
+    desired: dict[str, int] = {}
+    for row in step["targets"]:
+        weight = decimal_value(row["weight"], "target.weight")
+        price = decimal_value(row["price"], "target.price")
         lot = int(row["lot_size"])
         raw = investable * weight / total / price
         lots = (raw / lot).to_integral_value(rounding=ROUND_FLOOR)
