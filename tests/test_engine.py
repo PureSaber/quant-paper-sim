@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from quant_paper_sim.engine import rebalance, run_step
 from quant_paper_sim.models import PortfolioState, SignalBundle, TargetPosition
 from quant_paper_sim.readers.signals import load_q5_csv, load_regime_scale, load_signal_yaml
@@ -11,6 +13,42 @@ def test_regime_scale():
     path = Path(__file__).parent / "fixtures" / "regime.json"
     assert load_regime_scale(path) == 0.8
     assert load_regime_scale(None) == 1.0
+
+
+def test_configured_regime_file_must_exist(tmp_path: Path):
+    with pytest.raises(FileNotFoundError):
+        load_regime_scale(tmp_path / "missing.json")
+    with pytest.raises(OSError):
+        load_regime_scale(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "{}",
+        "[]",
+        "null",
+        '{"position_scale": null}',
+        '{"position_scale": true}',
+        '{"position_scale": "bad"}',
+        '{"position_scale": NaN}',
+        '{"position_scale": Infinity}',
+        '{"position_scale": -0.1}',
+        '{"position_scale": 1.1}',
+    ],
+)
+def test_regime_scale_rejects_invalid_payload(tmp_path: Path, content: str):
+    path = tmp_path / "regime.json"
+    path.write_text(content, encoding="utf-8")
+    with pytest.raises(ValueError, match="position_scale"):
+        load_regime_scale(path)
+
+
+@pytest.mark.parametrize("scale", [0, 0.5, 1])
+def test_regime_scale_accepts_risk_boundaries(tmp_path: Path, scale: float):
+    path = tmp_path / "regime.json"
+    path.write_text(f'{{"position_scale": {scale}}}', encoding="utf-8")
+    assert load_regime_scale(path) == scale
 
 
 def test_rebalance_respects_lot_and_scale():

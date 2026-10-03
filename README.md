@@ -30,6 +30,12 @@ On a completely new state directory, `step` records an explicit
 `fresh_step_bootstrap` migration and opens the configured cash ledger. `init` always resets
 the authoritative journal and all compatibility projections.
 
+An omitted regime source uses scale`1.0`. Once`regime.path`is configured, the file must
+be readable and contain a finite`position_scale`in`[0, 1]`; missing files, missing fields,
+booleans and invalid values abort the step without appending to the authoritative journal.
+An explicit`regime.override_scale`must satisfy the same range and does not bypass validation
+of a configured source file. Zero is a valid risk-off scale.
+
 ## Execution path
 
 Every accepted step is replayed through one path:

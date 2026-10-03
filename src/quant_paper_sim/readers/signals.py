@@ -50,11 +50,23 @@ def load_config(path: Path) -> dict:
         return yaml.safe_load(f) or {}
 
 
+def _regime_scale(value: object, field: str) -> float:
+    try:
+        scale = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{field} must be a finite number in [0, 1]") from exc
+    if isinstance(value, bool) or not math.isfinite(scale) or not 0 <= scale <= 1:
+        raise ValueError(f"{field} must be a finite number in [0, 1]")
+    return scale
+
+
 def load_regime_scale(path: Path | None) -> float:
-    if path is None or not path.is_file():
+    if path is None:
         return 1.0
     data = json.loads(path.read_text(encoding="utf-8"))
-    return float(data.get("position_scale", 1.0))
+    if not isinstance(data, dict) or "position_scale" not in data:
+        raise ValueError(f"regime file must contain position_scale: {path}")
+    return _regime_scale(data["position_scale"], "position_scale")
 
 
 def load_signal_yaml(path: Path, cash_reserve: float, regime_scale: float) -> SignalBundle:
@@ -170,7 +182,7 @@ def load_signals(cfg: dict, config_path: Path) -> SignalBundle:
         resolve_data_path(str(regime_path), config_path) if regime_path else None
     )
     if regime_cfg.get("override_scale") is not None:
-        regime_scale = float(regime_cfg["override_scale"])
+        regime_scale = _regime_scale(regime_cfg["override_scale"], "regime.override_scale")
 
     cash_reserve = float(cfg.get("cash_reserve", 0.05))
     source = str(sig.get("source", "yaml"))
