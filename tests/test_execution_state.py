@@ -100,6 +100,34 @@ def test_cli_init_step_status_and_authoritative_files(tmp_path: Path, capsys) ->
     assert not (state_dir / ".paper_commit_pending.json").exists()
 
 
+@pytest.mark.parametrize("regime_content", [None, "{}", '{"position_scale": null}'])
+def test_bad_regime_never_appends_or_changes_authority(tmp_path: Path, regime_content) -> None:
+    config, signal, state_dir = paper_config(tmp_path)
+    write_signal(signal, as_of="2026-07-28", targets=[("000001", 1.0, 10.0)])
+    run_step(config)
+    before = (state_dir / "execution_log.json").read_bytes()
+    regime = tmp_path / "regime.json"
+    if regime_content is not None:
+        regime.write_text(regime_content, encoding="utf-8")
+    cfg = load_config(config)
+    cfg["regime"] = {"path": str(regime)}
+    config.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+    write_signal(signal, as_of="2026-07-29", targets=[("000001", 1.0, 11.0)])
+    with pytest.raises((FileNotFoundError, ValueError)):
+        run_step(config)
+    assert (state_dir / "execution_log.json").read_bytes() == before
+
+
+@pytest.mark.parametrize("scale", [True, "nan", "inf", -0.1, 1.1, "bad"])
+def test_invalid_regime_override_is_rejected(tmp_path: Path, scale) -> None:
+    config, signal, _ = paper_config(tmp_path)
+    write_signal(signal, as_of="2026-07-28", targets=[("000001", 1.0, 10.0)])
+    cfg = load_config(config)
+    cfg["regime"] = {"override_scale": scale}
+    with pytest.raises(ValueError, match="regime.override_scale"):
+        load_signals(cfg, config)
+
+
 def test_projection_tampering_never_changes_authoritative_state(tmp_path: Path) -> None:
     config, signal, state_dir = paper_config(tmp_path)
     write_signal(signal, as_of="2026-07-28", targets=[("000001", 1.0, 10.0)])
@@ -308,6 +336,9 @@ def test_pipeline_command_and_relative_paths_remain_supported(tmp_path: Path) ->
         ROOT / "tests" / "fixtures" / "signals.yaml",
         tmp_path / "tests" / "fixtures" / "signals.yaml",
     )
+    regime_dir = tmp_path / "quant-regime" / "state"
+    regime_dir.mkdir(parents=True)
+    shutil.copy(ROOT / "tests" / "fixtures" / "regime.json", regime_dir / "regime.json")
     env = os.environ.copy()
     env["PYTHONPATH"] = str(ROOT / "src")
     completed = subprocess.run(
@@ -320,6 +351,8 @@ def test_pipeline_command_and_relative_paths_remain_supported(tmp_path: Path) ->
     )
     assert "paper step" in completed.stdout
     assert (tmp_path / "state" / "execution_log.json").is_file()
+    log = load_log(tmp_path / "state" / "execution_log.json")
+    assert log["steps"][0]["regime_scale"] == "0.8"
 
 
 def test_factor_csv_is_a_real_supported_source_and_unknown_source_fails(tmp_path: Path) -> None:
