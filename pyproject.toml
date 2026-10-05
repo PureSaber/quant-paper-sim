@@ -20,7 +20,7 @@ dev = [
     "exceptiongroup>=1; python_version < '3.11'",
     "pytest>=8.0,<10.0",
     "pytest-cov>=5.0,<8.0",
-    "ruff==0.16.6",
+    "ruff==0.16.10",
     "tomli>=1; python_version < '3.11'",
 ]
 
