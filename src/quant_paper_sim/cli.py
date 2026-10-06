@@ -8,6 +8,7 @@ import yaml
 from quant_execution import ReplayError
 
 from quant_paper_sim.engine import initialize, preflight, run_step, status
+from quant_paper_sim.recovery import backup_state, restore_state, verify_state
 from quant_paper_sim.state import StateError
 
 
@@ -19,13 +20,29 @@ def main(argv: list[str] | None = None) -> None:
         ("init", "Reset authoritative paper execution state to cash"),
         ("status", "Replay authoritative state and print its portfolio projection"),
         ("preflight", "Read and validate inputs without replaying or modifying the account"),
+        ("verify", "Replay and inspect saved account evidence without modifying files"),
+        ("backup", "Create an independent verified authoritative journal backup"),
+        ("restore", "Restore a verified backup to an empty state directory"),
     ):
         item = sub.add_parser(command, help=help_text)
         item.add_argument("--config", required=True)
+        if command == "backup":
+            item.add_argument("--out", required=True, type=Path)
+        elif command == "restore":
+            item.add_argument("--backup", required=True, type=Path)
 
     args = parser.parse_args(argv)
     config_path = Path(args.config)
     try:
+        if args.command in {"verify", "backup", "restore"}:
+            if args.command == "backup":
+                evidence = backup_state(config_path, args.out)
+            elif args.command == "restore":
+                evidence = restore_state(config_path, args.backup)
+            else:
+                evidence = verify_state(config_path)
+            print(json.dumps(evidence, indent=2, ensure_ascii=False))
+            return
         if args.command == "preflight":
             print(json.dumps(preflight(config_path), indent=2, ensure_ascii=False))
             return
