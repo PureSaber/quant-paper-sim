@@ -80,6 +80,35 @@ provenance explicitly.
 
 ## Authoritative state
 
+### 低频账本核验、独立备份与恢复
+
+```powershell
+quant-paper verify --config configs/paper.yaml
+quant-paper backup --config configs/paper.yaml --out backups/account-20261006
+quant-paper restore --config configs/recovered.yaml --backup backups/account-20261006
+```
+
+`verify`只读回放权威日志，核对成交、费用、事件及累计账本哈希，并将全部账户投影
+与回放结果比较；它不创建目录、不取写锁、不迁移和改写文件。返回
+`replay_verified`、`projection_status`、`mismatched_files`及`pending_commit`。
+`needs_rebuild`说明投影缺失、损坏或存在未清理提交标记；权威日志有效时可使用既有
+`status`重新生成投影。日志或历史归档损坏时明确失败，不从投影余额重建账户。
+
+`backup`取账户写锁，在真实回放通过后创建全新且独立的目录，保存权威日志原始字节、
+全部嵌套历史归档及逐文件SHA-256清单。它不会覆盖已有备份；最后写入清单作为完成
+标记。备份只包含账户事实，不包含信号、市场输入、运行环境或配置；这些另行保存。
+
+恢复配置的`state_dir`必须指向空目录，成交规则和证券目录必须与备份一致。
+`restore`先核验全部备份、版本白名单和回放哈希，再安装原始权威字节并生成投影。
+恢复不要求原信号文件仍存在。原状态、现有账户与旧认证资料不会被覆盖；也无需`init`。
+权威日志安装后若投影写入中断，使用`status --config configs/recovered.yaml`继续重建；
+已存在状态的目录不会接受第二次`restore`。
+
+验收包括提交前后杀死独立进程、写锁自动释放、重复步进只记一次、规则不匹配、
+伪造投影清单、损坏/缺失备份及嵌套归档的独立恢复。当前锁定
+`quant-execution@v0.5.1`，仍为低频研究模拟，不增加纳秒或真实券商执行能力。
+
+
 `state/execution_log.json` is the only persisted execution truth. It contains:
 
 - schema and exact `quant-execution` version;
