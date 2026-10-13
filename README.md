@@ -7,6 +7,11 @@ maintain a second portfolio implementation and it has no live-order path.
 
 ## Commands
 
+`init` creates an account only in an empty `state_dir`; it refuses to overwrite an existing
+journal, projection, legacy file, or incomplete account. To start over, back up the old account
+and configure a separate empty directory. A configuration mismatch is repaired by restoring
+the original configuration or creating a separate account, never by resetting its journal.
+
 ```bash
 python -m pip install --no-deps -r requirements.lock
 python -m pip check
