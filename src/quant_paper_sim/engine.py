@@ -120,7 +120,7 @@ def _assert_config_compatible(
     if log["execution_config"] != _execution_config(cfg, catalog):
         raise StateError(
             "execution configuration differs from the authoritative log; "
-            "run quant-paper init to start a new state"
+            "restore the original configuration, or back up this account and use a new empty state_dir"
         )
 
 
@@ -589,6 +589,11 @@ def initialize(config_path: Path) -> RebalanceResult:
     paths = _state_paths(config_path, cfg)
     initial_capital = float(cfg.get("initial_capital", 100_000))
     with state_writer_lock(paths.root):
+        if any(entry.name != ".paper_state.lock" for entry in paths.root.iterdir()):
+            raise StateError(
+                "init requires an empty state directory; existing account files were preserved. "
+                "Use quant-paper backup, then configure a new empty state_dir for a new account"
+            )
         log = new_log(
             initial_cash=initial_capital,
             execution_config=_execution_config(cfg, catalog),

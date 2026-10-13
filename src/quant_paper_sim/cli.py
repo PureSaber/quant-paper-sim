@@ -17,7 +17,7 @@ def main(argv: list[str] | None = None) -> None:
     sub = parser.add_subparsers(dest="command", required=True)
     for command, help_text in (
         ("step", "Load research-close signals and execute a paper rebalance"),
-        ("init", "Reset authoritative paper execution state to cash"),
+        ("init", "Initialize a new cash account in an empty state directory"),
         ("status", "Replay authoritative state and print its portfolio projection"),
         ("preflight", "Read and validate inputs without replaying or modifying the account"),
         ("verify", "Replay and inspect saved account evidence without modifying files"),

@@ -403,7 +403,11 @@ def test_three_complete_runs_have_identical_authoritative_and_execution_hashes(
 ) -> None:
     config, _, state = paper_case(tmp_path)
     hashes: list[tuple[str, str, str, str, str]] = []
-    for _ in range(3):
+    original = yaml.safe_load(config.read_text(encoding="utf-8"))
+    for number in range(3):
+        # Each deterministic replay starts a separate account; init never resets one.
+        state = tmp_path / f"replay-{number}"
+        config.write_text(yaml.safe_dump(original | {"state_dir": str(state)}), encoding="utf-8")
         initialize(config)
         run_step(config)
         log = load_log(state / "execution_log.json")
